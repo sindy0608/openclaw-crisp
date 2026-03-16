@@ -246,6 +246,8 @@ export const crispPlugin = {
     defaultRuntime: {
       accountId: DEFAULT_ACCOUNT_ID,
       running: false,
+      connected: false,
+      mode: "webhook",
       lastStartAt: null,
       lastStopAt: null,
       lastError: null,
@@ -267,17 +269,19 @@ export const crispPlugin = {
 
     buildAccountSnapshot: (params: {
       account: ResolvedCrispAccount;
-      runtime?: { running?: boolean; lastStartAt?: number | null };
+      runtime?: { running?: boolean; connected?: boolean; lastStartAt?: number | null };
     }) => {
       const { account, runtime } = params;
+      const passiveReady = account.enabled && account.configured;
       return {
         accountId: account.accountId,
         name: account.name,
         enabled: account.enabled,
         configured: account.configured,
         baseUrl: account.baseUrl,
-        running: runtime?.running ?? false,
-        connected: runtime?.running ?? false,
+        mode: "webhook",
+        running: runtime?.running ?? passiveReady,
+        connected: runtime?.connected ?? passiveReady,
         lastStartAt: runtime?.lastStartAt ?? null,
       };
     },
@@ -292,7 +296,7 @@ export const crispPlugin = {
       setStatus: (patch: Record<string, unknown>) => void;
       abortSignal: AbortSignal;
     }) => {
-      const { account, runtime, setStatus } = ctx;
+      const { account, runtime, setStatus, abortSignal } = ctx;
       const webhookPath = resolveWebhookPath(account.config);
 
       runtime.log?.info?.(`[crisp:${account.accountId}] Starting (webhook=${webhookPath})`);
@@ -300,19 +304,32 @@ export const crispPlugin = {
       setStatus({
         accountId: account.accountId,
         baseUrl: account.baseUrl,
+        mode: "webhook",
         running: true,
+        connected: true,
         lastStartAt: Date.now(),
       });
 
-      // The actual webhook handling is done via registerHttpHandler
-      // This just marks the account as running
-
-      return {
-        stop: async () => {
+      // Webhook channels are passive: keep the channel task alive until OpenClaw aborts it.
+      await new Promise<void>((resolve) => {
+        const onAbort = () => {
           runtime.log?.info?.(`[crisp:${account.accountId}] Stopping`);
-          setStatus({ running: false, lastStopAt: Date.now() });
-        },
-      };
+          setStatus({
+            accountId: account.accountId,
+            running: false,
+            connected: false,
+            lastStopAt: Date.now(),
+          });
+          resolve();
+        };
+
+        if (abortSignal.aborted) {
+          onAbort();
+          return;
+        }
+
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+      });
     },
   },
 };
@@ -322,6 +339,13 @@ let storedClawdbotConfig: Record<string, unknown> | null = null;
 
 export function setClawdbotConfig(cfg: Record<string, unknown>): void {
   storedClawdbotConfig = cfg;
+}
+
+export function getClawdbotConfig(): Record<string, unknown> {
+  if (!storedClawdbotConfig) {
+    throw new Error("Clawdbot config not initialized");
+  }
+  return storedClawdbotConfig;
 }
 
 /**

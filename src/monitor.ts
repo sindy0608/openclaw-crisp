@@ -14,6 +14,17 @@ import {
   type CrispWebhookPayload,
 } from "./types.js";
 import { createCrispClient } from "./api-client.js";
+import {
+  isHumanHandoffMessage,
+  isGlobalAutoModeEnabled,
+  isManagedSession,
+  isManagedModeDisableCommand,
+  isManagedModeEnableCommand,
+  isSolvedMessage,
+  markManagedSession,
+  releaseManagedSession,
+} from "./managed-sessions.js";
+import { buildSupportKnowledge } from "./kb.js";
 import { getCrispRuntime, hasCrispRuntime } from "./runtime.js";
 import { storePendingReply, updatePendingReplyTelegram } from "./pending-replies.js";
 import { sendTelegramNotification } from "./telegram-notify.js";
@@ -158,6 +169,83 @@ export async function sendCrispReply(
   }
 }
 
+async function storePendingReplyAndNotify(params: {
+  config: CrispConfig;
+  core: ReturnType<typeof getCrispRuntime>;
+  route: { sessionKey: string };
+  accountId: string;
+  sessionId: string;
+  websiteId: string;
+  visitorName: string;
+  messageText: string;
+  mediaUrl?: string;
+}): Promise<void> {
+  const { config, core, route, accountId, sessionId, websiteId, visitorName, messageText, mediaUrl } = params;
+
+  const pending = storePendingReply({
+    crispSessionId: sessionId,
+    crispWebsiteId: websiteId,
+    visitorName,
+    visitorMessage: messageText,
+    proposedReply: "",
+    mediaUrl,
+    accountId,
+    crispApiKeyId: config.apiKeyId,
+    crispApiKeySecret: config.apiKeySecret,
+    resolveOnReply: config.resolveOnReply,
+    siteName: config.name || websiteId,
+  });
+
+  console.log(`[crisp] 📋 Stored pending message [${pending.id}]`);
+  console.log(`[crisp] 👤 From: ${visitorName}`);
+  console.log(`[crisp] 💬 Message: "${messageText}"`);
+
+  if (config.telegramBotToken && config.approvalChatId) {
+    try {
+      const result = await sendTelegramNotification({
+        botToken: config.telegramBotToken,
+        chatId: config.approvalChatId,
+        threadId: config.approvalThreadId ?? config.approvalTopicId,
+        pendingId: pending.id,
+        siteName: config.name || websiteId,
+        visitorName,
+        visitorMessage: messageText,
+        mediaUrl,
+      });
+
+      if (result.ok && result.messageId) {
+        console.log(`[crisp] 📱 Telegram notification sent (msg ${result.messageId})`);
+        updatePendingReplyTelegram(
+          pending.id,
+          String(result.messageId),
+          config.approvalChatId,
+          config.approvalThreadId ?? config.approvalTopicId ? String(config.approvalThreadId ?? config.approvalTopicId) : undefined,
+          config.telegramBotToken,
+        );
+      } else {
+        console.error(`[crisp] ❌ Telegram notification failed: ${result.error}`);
+      }
+    } catch (err) {
+      console.error(`[crisp] ❌ Failed to send Telegram notification:`, err);
+    }
+    return;
+  }
+
+  console.log(`[crisp] ⚠️ Telegram not configured, skipping notification`);
+  try {
+    core.system.enqueueSystemEvent(
+      `🆕 CRISP_MESSAGE [${pending.id}] from "${visitorName}": "${messageText}"`,
+      {
+        sessionKey: route.sessionKey,
+        contextKey: `crisp:pending:${pending.id}`,
+      }
+    );
+    console.log(`[crisp] 📤 System event emitted for [${pending.id}]`);
+  } catch (err) {
+    console.error(`[crisp] ❌ Failed to emit system event:`, err);
+  }
+}
+
 /**
  * Handle inbound message from Crisp
  */
@@ -184,8 +272,13 @@ async function handleInboundMessage(
   const sessionId = data.session_id;
   const visitorName = data.user?.nickname || "Visitor";
   const isFile = data.type === "file";
-  const messageText = isFile ? "[Fichier envoyé]" : (data.content || "");
+  const messageText = isFile ? "图片" : (data.content || "");
   const mediaUrl = isFile ? (data.content || "") : undefined;
+  const managedSessionKey = {
+    accountId,
+    websiteId: data.website_id,
+    sessionId,
+  };
 
   console.log(`[crisp] 📩 Message from ${visitorName}: "${messageText}"`);
   console.log(`[crisp] Session: ${sessionId}, Website: ${data.website_id}`);
@@ -201,6 +294,10 @@ async function handleInboundMessage(
 
   if (session.isNew) {
     console.log(`[crisp] 🆕 New conversation started`);
+    if (isGlobalAutoModeEnabled()) {
+      markManagedSession(managedSessionKey);
+      console.log(`[crisp] 🤖 Global auto mode: defaulting new conversation ${sessionId} to managed mode`);
+    }
   }
 
   // Skip if auto-reply is disabled and not in approval mode
@@ -220,6 +317,56 @@ async function handleInboundMessage(
     apiKeyId: config.apiKeyId,
     apiKeySecret: config.apiKeySecret,
   });
+
+  const sendManagedModeFeedback = async (content: string): Promise<void> => {
+    await client.sendMessage({
+      websiteId: data.website_id,
+      sessionId,
+      content,
+    });
+  };
+
+  if (!isFile && isManagedModeEnableCommand(messageText)) {
+    markManagedSession(managedSessionKey);
+    console.log(`[crisp] 🫴 Managed mode enabled for session ${sessionId}`);
+    await sendManagedModeFeedback("已开启托管模式。后续消息默认由 AI 托管，不再转发到人工通知；如需人工协助，请发送“人工”。");
+    return;
+  }
+
+  if (!isFile && isManagedModeDisableCommand(messageText)) {
+    const wasManaged = releaseManagedSession(managedSessionKey);
+    console.log(`[crisp] ↩️ Managed mode ${wasManaged ? "disabled" : "already off"} for session ${sessionId}`);
+    await sendManagedModeFeedback(
+      wasManaged
+        ? "已关闭托管模式。后续消息将恢复转发到人工通知。"
+        : "当前未处于托管模式。后续消息仍会按原流程处理。"
+    );
+    return;
+  }
+
+  if (!isFile && isSolvedMessage(messageText)) {
+    const closingMessage = "好的，感谢您的反馈～如果后续还有问题，随时联系我。祝您生活愉快！";
+    try {
+      await client.sendMessage({
+        websiteId: data.website_id,
+        sessionId,
+        content: closingMessage,
+      });
+      console.log(`[crisp] 🙏 Sent closing message before resolve for ${sessionId}`);
+      await client.updateConversationState(data.website_id, sessionId, "resolved");
+      console.log(`[crisp] ✅ Marked conversation resolved from visitor confirmation: ${sessionId}`);
+      releaseManagedSession(managedSessionKey);
+      console.log(`[crisp] 🔓 Closed managed session without ignoring future follow-ups: ${sessionId}`);
+    } catch (err) {
+      console.error(`[crisp] ❌ Failed to close resolved session ${sessionId}:`, err);
+    }
+    return;
+  }
+
+  const normalizedMessageText = mediaUrl ? "图片" : messageText;
+
+  const isSessionManaged = isManagedSession(managedSessionKey);
+  const needsHumanHandoff = isHumanHandoffMessage(normalizedMessageText);
 
   // Fetch conversation history for AI context
   let historyText = "";
@@ -243,9 +390,13 @@ async function handleInboundMessage(
     }
   }
 
-  // Build body with optional media placeholder
-  const mediaPlaceholder = mediaUrl ? " <media:file>" : "";
-  const body = `${messageText}${mediaPlaceholder}${historyText}`;
+  // Build body as plain text only; image/file messages are downgraded to the literal text "图片"
+  const supportContext = await buildSupportKnowledge({
+    accountId,
+    websiteId: data.website_id,
+    siteName: config.name,
+  });
+  const body = `${normalizedMessageText}${historyText}\n\n${supportContext}`;
 
   // Resolve agent route
   const route = core.channel.routing.resolveAgentRoute({
@@ -262,10 +413,10 @@ async function handleInboundMessage(
   const ctxPayload = {
     Body: body,
     BodyForAgent: body,
-    RawBody: messageText,
-    CommandBody: messageText,
-    BodyForCommands: messageText,
-    MediaUrl: mediaUrl,
+    RawBody: normalizedMessageText,
+    CommandBody: normalizedMessageText,
+    BodyForCommands: normalizedMessageText,
+    MediaUrl: undefined,
     From: `crisp:${sessionId}`,
     To: `crisp:${sessionId}`,
     SessionKey: route.sessionKey,
@@ -287,62 +438,39 @@ async function handleInboundMessage(
   // =========================================================================
   // APPROVAL MODE: Store message and send Telegram notification
   // =========================================================================
-  if (config.approvalMode) {
+  if (config.approvalMode && !isSessionManaged) {
     console.log(`[crisp] 🔄 Approval mode: storing for human review...`);
-    
-    // Store the pending reply (without AI proposal - will be generated by main agent)
-    const pending = storePendingReply({
-      crispSessionId: sessionId,
-      crispWebsiteId: data.website_id,
-      visitorName,
-      visitorMessage: messageText,
-      proposedReply: "", // Will be filled by main agent
+
+    await storePendingReplyAndNotify({
+      config,
+      core,
+      route,
       accountId,
+      sessionId,
+      websiteId: data.website_id,
+      visitorName,
+      messageText: normalizedMessageText,
+      mediaUrl: undefined,
     });
-
-    console.log(`[crisp] 📋 Stored pending message [${pending.id}]`);
-    console.log(`[crisp] 👤 From: ${visitorName}`);
-    console.log(`[crisp] 💬 Message: "${messageText}"`);
-
-    // Send Telegram notification if configured
-    if (config.telegramBotToken && config.approvalChatId) {
-      try {
-        const result = await sendTelegramNotification({
-          botToken: config.telegramBotToken,
-          chatId: config.approvalChatId,
-          pendingId: pending.id,
-          visitorName,
-          visitorMessage: messageText,
-        });
-        
-        if (result.ok && result.messageId) {
-          console.log(`[crisp] 📱 Telegram notification sent (msg ${result.messageId})`);
-          // Store telegram message ID for reply detection
-          updatePendingReplyTelegram(pending.id, String(result.messageId), config.approvalChatId!);
-        } else {
-          console.error(`[crisp] ❌ Telegram notification failed: ${result.error}`);
-        }
-      } catch (err) {
-        console.error(`[crisp] ❌ Failed to send Telegram notification:`, err);
-      }
-    } else {
-      console.log(`[crisp] ⚠️ Telegram not configured, skipping notification`);
-      // Fallback: emit system event
-      try {
-        core.system.enqueueSystemEvent(
-          `🆕 CRISP_MESSAGE [${pending.id}] from "${visitorName}": "${messageText}"`,
-          {
-            sessionKey: route.sessionKey,
-            contextKey: `crisp:pending:${pending.id}`,
-          }
-        );
-        console.log(`[crisp] 📤 System event emitted for [${pending.id}]`);
-      } catch (err) {
-        console.error(`[crisp] ❌ Failed to emit system event:`, err);
-      }
-    }
-
     return;
+  }
+
+  if (isSessionManaged) {
+    if (needsHumanHandoff) {
+      console.log(`[crisp] 🧑‍💼 Managed session: human-handoff keyword detected, but keeping AI auto-reply on and still notifying Telegram`);
+      await storePendingReplyAndNotify({
+        config,
+        core,
+        route,
+        accountId,
+        sessionId,
+        websiteId: data.website_id,
+        visitorName,
+        messageText: normalizedMessageText,
+        mediaUrl: undefined,
+      });
+    }
+    console.log(`[crisp] 🫴 Managed session: suppressing approval forwarding and using auto-reply`);
   }
 
   // =========================================================================
@@ -365,7 +493,7 @@ async function handleInboundMessage(
           console.log(`[crisp] ✅ Sent AI reply to ${sessionId}`);
 
           if (config.resolveOnReply) {
-            await client.updateConversationState(data.website_id, sessionId, "resolved");
+            console.log(`[crisp] ⚠️ resolveOnReply is enabled for ${sessionId}, but auto-managed replies will stay open to allow follow-up messages`);
           }
         },
         onError: (err: unknown) => {

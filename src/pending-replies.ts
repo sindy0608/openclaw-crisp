@@ -4,6 +4,8 @@
  * Stores Crisp messages waiting for human approval before sending reply.
  */
 
+import { markManagedSession } from "./managed-sessions.js";
+
 export interface PendingReply {
   id: string;
   crispSessionId: string;
@@ -11,10 +13,17 @@ export interface PendingReply {
   visitorName: string;
   visitorMessage: string;
   proposedReply: string;
+  mediaUrl?: string;
   telegramMessageId?: string;
   telegramChatId?: string;
+  telegramThreadId?: string;
+  telegramBotToken?: string;
   createdAt: number;
   accountId: string;
+  crispApiKeyId: string;
+  crispApiKeySecret: string;
+  resolveOnReply?: boolean;
+  siteName?: string;
 }
 
 // In-memory store for pending replies
@@ -81,27 +90,63 @@ export function removePendingReply(id: string): boolean {
  * Update telegram message info for a pending reply
  */
 export function updatePendingReplyTelegram(
-  id: string, 
-  telegramMessageId: string, 
-  telegramChatId: string
+  id: string,
+  telegramMessageId: string,
+  telegramChatId: string,
+  telegramThreadId?: string,
+  telegramBotToken?: string
 ): void {
   const pending = pendingReplies.get(id.toUpperCase());
   if (pending) {
     pending.telegramMessageId = telegramMessageId;
     pending.telegramChatId = telegramChatId;
+    pending.telegramThreadId = telegramThreadId;
+    pending.telegramBotToken = telegramBotToken;
   }
+}
+
+/**
+ * Mark the pending reply's session as managed/taken over.
+ */
+export function markPendingReplySessionManaged(id: string): PendingReply | null {
+  const pending = getPendingReply(id);
+  if (!pending) {
+    return null;
+  }
+
+  markManagedSession({
+    accountId: pending.accountId,
+    websiteId: pending.crispWebsiteId,
+    sessionId: pending.crispSessionId,
+  });
+
+  return pending;
 }
 
 /**
  * Find pending reply by Telegram message ID (for reply detection)
  */
-export function findPendingReplyByTelegramMessage(
-  telegramMessageId: string
-): PendingReply | null {
+export function findPendingReplyByTelegramMessage(params: {
+  telegramMessageId: string;
+  telegramChatId?: string;
+  telegramThreadId?: string;
+  telegramBotToken?: string;
+}): PendingReply | null {
+  const { telegramMessageId, telegramChatId, telegramThreadId, telegramBotToken } = params;
   for (const pending of pendingReplies.values()) {
-    if (pending.telegramMessageId === telegramMessageId) {
-      return pending;
+    if (pending.telegramMessageId !== telegramMessageId) {
+      continue;
     }
+    if (telegramChatId && pending.telegramChatId !== telegramChatId) {
+      continue;
+    }
+    if (telegramThreadId && pending.telegramThreadId && pending.telegramThreadId !== telegramThreadId) {
+      continue;
+    }
+    if (telegramBotToken && pending.telegramBotToken && pending.telegramBotToken !== telegramBotToken) {
+      continue;
+    }
+    return pending;
   }
   return null;
 }

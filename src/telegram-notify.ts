@@ -7,21 +7,31 @@
 interface TelegramNotifyOptions {
   botToken: string;
   chatId: string;
+  threadId?: string | number;
   pendingId: string;
+  siteName: string;
   visitorName: string;
   visitorMessage: string;
+  mediaUrl?: string;
 }
 
 /**
  * Send a Crisp message notification to Telegram with inline buttons
  */
 export async function sendTelegramNotification(opts: TelegramNotifyOptions): Promise<{ ok: boolean; messageId?: number; error?: string }> {
-  const { botToken, chatId, pendingId, visitorName, visitorMessage } = opts;
+  const { botToken, chatId, threadId, pendingId, siteName, visitorName, visitorMessage, mediaUrl } = opts;
+  const normalizedThreadId = normalizeThreadId(threadId);
 
-  const text = `🆕 *Nouveau message Crisp* \\[${pendingId}\\]\n\n` +
-    `👤 *${escapeMarkdown(visitorName)}*\n` +
-    `💬 "${escapeMarkdown(visitorMessage)}"\n\n` +
-    `_Réponds à ce message pour envoyer ta réponse, ou ignore\\._`;
+  const mediaBlock = mediaUrl
+    ? `🖼 *图片链接:* ${escapeMarkdown(mediaUrl)}\n`
+    : "";
+
+  const text = `🆕 *新的 Crisp 消息* \\[${pendingId}\\]\n\n` +
+    `🌐 *网站:* ${escapeMarkdown(siteName)}\n` +
+    `👤 *访客:* ${escapeMarkdown(visitorName)}\n` +
+    `💬 "${escapeMarkdown(visitorMessage)}"\n` +
+    mediaBlock +
+    `\n_直接回复这条消息即可发送回复，也可以使用下方按钮\\._`;
 
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
 
@@ -31,13 +41,14 @@ export async function sendTelegramNotification(opts: TelegramNotifyOptions): Pro
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
+        ...(normalizedThreadId !== undefined ? { message_thread_id: normalizedThreadId } : {}),
         text,
         parse_mode: "MarkdownV2",
         reply_markup: {
           inline_keyboard: [
             [
-              { text: "✅ Répondre", callback_data: `crisp_reply_${pendingId}` },
-              { text: "❌ Ignorer", callback_data: `crisp_ignore_${pendingId}` },
+              { text: "❌ 忽略", callback_data: `crisp_ignore_${pendingId}` },
+              { text: "🫴 托管", callback_data: `crisp_takeover_${pendingId}` },
             ],
           ],
         },
@@ -63,4 +74,12 @@ export async function sendTelegramNotification(opts: TelegramNotifyOptions): Pro
  */
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*\[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+}
+
+function normalizeThreadId(threadId: string | number | undefined): number | undefined {
+  if (threadId === undefined || threadId === null) {
+    return undefined;
+  }
+  const parsed = Number(threadId);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }

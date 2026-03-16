@@ -1,5 +1,5 @@
 {
-  "id": "crisp",
+  "id": "openclaw-crisp",
   "name": "Crisp",
   "description": "Crisp website chat channel for OpenClaw",
   "channels": ["crisp"],

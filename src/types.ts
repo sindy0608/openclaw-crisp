@@ -43,6 +43,10 @@ export const CrispConfigSchema = z.object({
   approvalMode: z.boolean().default(false),
   /** Telegram chat ID for approval notifications */
   approvalChatId: z.string().optional(),
+  /** Telegram forum topic/thread ID for approval notifications */
+  approvalThreadId: z.union([z.string(), z.number().int()]).optional(),
+  /** Backward-compatible alias for approvalThreadId */
+  approvalTopicId: z.union([z.string(), z.number().int()]).optional(),
   /** Telegram bot token (from Clawdbot config) */
   telegramBotToken: z.string().optional(),
 });

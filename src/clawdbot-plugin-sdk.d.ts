@@ -91,12 +91,16 @@ declare module "clawdbot/plugin-sdk" {
     runtime: PluginRuntime;
     config: ClawdbotConfig;
     registerChannel(opts: { plugin: unknown }): void;
-    registerHttpHandler(
+    registerHttpRoute(params: {
+      path: string;
       handler: (
         req: import("node:http").IncomingMessage,
         res: import("node:http").ServerResponse
-      ) => Promise<boolean>
-    ): void;
+      ) => Promise<boolean | void> | boolean | void;
+      auth: "gateway" | "plugin";
+      match?: "exact" | "prefix";
+      replaceExisting?: boolean;
+    }): void;
   }
 
   export function emptyPluginConfigSchema(): { type: "object"; additionalProperties: boolean; properties: Record<string, never> };
