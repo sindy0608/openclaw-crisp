@@ -20,7 +20,6 @@ import {
   isManagedSession,
   isManagedModeDisableCommand,
   isManagedModeEnableCommand,
-  isSolvedMessage,
   markManagedSession,
   releaseManagedSession,
 } from "./managed-sessions.js";
@@ -341,25 +340,6 @@ async function handleInboundMessage(
         ? "已关闭托管模式。后续消息将恢复转发到人工通知。"
         : "当前未处于托管模式。后续消息仍会按原流程处理。"
     );
-    return;
-  }
-
-  if (!isFile && isSolvedMessage(messageText)) {
-    const closingMessage = "好的，感谢您的反馈～如果后续还有问题，随时联系我。祝您生活愉快！";
-    try {
-      await client.sendMessage({
-        websiteId: data.website_id,
-        sessionId,
-        content: closingMessage,
-      });
-      console.log(`[crisp] 🙏 Sent closing message before resolve for ${sessionId}`);
-      await client.updateConversationState(data.website_id, sessionId, "resolved");
-      console.log(`[crisp] ✅ Marked conversation resolved from visitor confirmation: ${sessionId}`);
-      releaseManagedSession(managedSessionKey);
-      console.log(`[crisp] 🔓 Closed managed session without ignoring future follow-ups: ${sessionId}`);
-    } catch (err) {
-      console.error(`[crisp] ❌ Failed to close resolved session ${sessionId}:`, err);
-    }
     return;
   }
 
