@@ -269,6 +269,7 @@ async function handleInboundMessage(
   }
 
   const sessionId = data.session_id;
+  const traceId = `${sessionId}:${Date.now().toString(36)}`;
   const visitorName = data.user?.nickname || "Visitor";
   const isFile = data.type === "file";
   const messageText = isFile ? "图片" : (data.content || "");
@@ -281,6 +282,7 @@ async function handleInboundMessage(
 
   console.log(`[crisp] 📩 Message from ${visitorName}: "${messageText}"`);
   console.log(`[crisp] Session: ${sessionId}, Website: ${data.website_id}`);
+  console.log(`[crisp] 🔎 Trace ${traceId} start inbound handling`);
 
   // Track session for deduplication
   const session = trackSession(
@@ -352,6 +354,7 @@ async function handleInboundMessage(
   let historyText = "";
   if (config.historyLimit > 0) {
     try {
+      console.log(`[crisp] 🔎 Trace ${traceId} fetching history (limit=${config.historyLimit})`);
       const messages = await client.getMessages(
         data.website_id,
         sessionId,
@@ -365,18 +368,22 @@ async function handleInboundMessage(
       if (history) {
         historyText = `\n\n[Previous messages]\n${history}\n[End of history]`;
       }
+      console.log(`[crisp] 🔎 Trace ${traceId} history ready (messages=${messages.length}, chars=${historyText.length})`);
     } catch (err) {
       console.warn(`[crisp] Failed to fetch history: ${err}`);
+      console.warn(`[crisp] 🔎 Trace ${traceId} history fetch failed`);
     }
   }
 
   // Build body as plain text only; image/file messages are downgraded to the literal text "图片"
+  console.log(`[crisp] 🔎 Trace ${traceId} building support knowledge`);
   const supportContext = await buildSupportKnowledge({
     accountId,
     websiteId: data.website_id,
     siteName: config.name,
   });
   const body = `${normalizedMessageText}${historyText}\n\n${supportContext}`;
+  console.log(`[crisp] 🔎 Trace ${traceId} support knowledge ready (chars=${supportContext.length}, bodyChars=${body.length})`);
 
   // Resolve agent route
   const route = core.channel.routing.resolveAgentRoute({
@@ -390,6 +397,8 @@ async function handleInboundMessage(
   });
 
   // Build context payload
+  console.log(`[crisp] 🔎 Trace ${traceId} route resolved sessionKey=${route.sessionKey}`);
+
   const ctxPayload = {
     Body: body,
     BodyForAgent: body,
@@ -456,69 +465,43 @@ async function handleInboundMessage(
   // =========================================================================
   // AUTO-REPLY MODE: Send AI response directly
   // =========================================================================
-  const FALLBACK_MESSAGE = "抱歉，处理您的消息时遇到了问题，请稍后再试或发送「人工」联系人工客服。";
-  const FIRST_REPLY_TIMEOUT_MS = 35000;
-  let hasDeliveredReply = false;
-  let hasSentFallback = false;
-
-  const sendFallbackOnce = async (reason: string): Promise<void> => {
-    if (hasDeliveredReply || hasSentFallback) {
-      return;
-    }
-    hasSentFallback = true;
-    try {
-      await client.sendMessage({
-        websiteId: data.website_id,
-        sessionId,
-        content: FALLBACK_MESSAGE,
-      });
-      console.log(`[crisp] ⚠️ Sent fallback reply to ${sessionId} (${reason})`);
-    } catch (sendErr) {
-      console.error(`[crisp] ❌ Failed to send fallback reply (${reason}):`, sendErr);
-    }
-  };
-
-  const firstReplyTimeout = setTimeout(() => {
-    void sendFallbackOnce("timeout-before-first-reply");
-  }, FIRST_REPLY_TIMEOUT_MS);
-
   try {
+    console.log(`[crisp] 🔎 Trace ${traceId} dispatch start`);
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: clawdbotConfig,
       dispatcherOptions: {
         deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string }) => {
+          console.log(`[crisp] 🔎 Trace ${traceId} deliver invoked (hasText=${Boolean(payload.text?.trim())}, mediaUrls=${payload.mediaUrls?.length ?? 0}, mediaUrl=${payload.mediaUrl ? 1 : 0})`);
           const text = payload.text?.trim();
           if (!text) {
             console.error(`[crisp] ❌ Empty reply for session ${sessionId}, model may have failed`);
-            await sendFallbackOnce("empty-reply");
             return;
           }
 
-          hasDeliveredReply = true;
-          clearTimeout(firstReplyTimeout);
+          console.log(`[crisp] 🔎 Trace ${traceId} sending message to Crisp (chars=${text.length})`);
           await client.sendMessage({
             websiteId: data.website_id,
             sessionId,
             content: text,
           });
           console.log(`[crisp] ✅ Sent AI reply to ${sessionId}`);
+          console.log(`[crisp] 🔎 Trace ${traceId} deliver complete`);
 
           if (config.resolveOnReply) {
             console.log(`[crisp] ⚠️ resolveOnReply is enabled for ${sessionId}, but auto-managed replies will stay open to allow follow-up messages`);
           }
         },
-        onError: async (err: unknown) => {
+        onError: (err: unknown) => {
           console.error(`[crisp] ❌ Reply dispatch error:`, err);
-          await sendFallbackOnce("dispatch-onError");
+          console.error(`[crisp] 🔎 Trace ${traceId} onError invoked`);
         },
       },
     });
+    console.log(`[crisp] 🔎 Trace ${traceId} dispatch complete`);
   } catch (err) {
     console.error(`[crisp] ❌ Failed to handle message:`, err);
-    await sendFallbackOnce("handle-message-catch");
-  } finally {
-    clearTimeout(firstReplyTimeout);
+    console.error(`[crisp] 🔎 Trace ${traceId} outer catch`);
   }
 }
 
