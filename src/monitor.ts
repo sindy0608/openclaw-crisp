@@ -463,7 +463,17 @@ async function handleInboundMessage(
       dispatcherOptions: {
         deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string }) => {
           const text = payload.text?.trim();
-          if (!text) return;
+          if (!text) {
+            console.error(`[crisp] ❌ Empty reply for session ${sessionId}, model may have failed`);
+            // 发送兜底回复给用户
+            await client.sendMessage({
+              websiteId: data.website_id,
+              sessionId,
+              content: "抱歉，处理您的消息时遇到了问题，请稍后再试或发送「人工」联系人工客服。",
+            });
+            console.log(`[crisp] ⚠️ Sent fallback reply to ${sessionId}`);
+            return;
+          }
 
           await client.sendMessage({
             websiteId: data.website_id,
