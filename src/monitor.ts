@@ -456,6 +456,32 @@ async function handleInboundMessage(
   // =========================================================================
   // AUTO-REPLY MODE: Send AI response directly
   // =========================================================================
+  const FALLBACK_MESSAGE = "抱歉，处理您的消息时遇到了问题，请稍后再试或发送「人工」联系人工客服。";
+  const FIRST_REPLY_TIMEOUT_MS = 15000;
+  let hasDeliveredReply = false;
+  let hasSentFallback = false;
+
+  const sendFallbackOnce = async (reason: string): Promise<void> => {
+    if (hasDeliveredReply || hasSentFallback) {
+      return;
+    }
+    hasSentFallback = true;
+    try {
+      await client.sendMessage({
+        websiteId: data.website_id,
+        sessionId,
+        content: FALLBACK_MESSAGE,
+      });
+      console.log(`[crisp] ⚠️ Sent fallback reply to ${sessionId} (${reason})`);
+    } catch (sendErr) {
+      console.error(`[crisp] ❌ Failed to send fallback reply (${reason}):`, sendErr);
+    }
+  };
+
+  const firstReplyTimeout = setTimeout(() => {
+    void sendFallbackOnce("timeout-before-first-reply");
+  }, FIRST_REPLY_TIMEOUT_MS);
+
   try {
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -465,16 +491,12 @@ async function handleInboundMessage(
           const text = payload.text?.trim();
           if (!text) {
             console.error(`[crisp] ❌ Empty reply for session ${sessionId}, model may have failed`);
-            // 发送兜底回复给用户
-            await client.sendMessage({
-              websiteId: data.website_id,
-              sessionId,
-              content: "抱歉，处理您的消息时遇到了问题，请稍后再试或发送「人工」联系人工客服。",
-            });
-            console.log(`[crisp] ⚠️ Sent fallback reply to ${sessionId}`);
+            await sendFallbackOnce("empty-reply");
             return;
           }
 
+          hasDeliveredReply = true;
+          clearTimeout(firstReplyTimeout);
           await client.sendMessage({
             websiteId: data.website_id,
             sessionId,
@@ -486,13 +508,17 @@ async function handleInboundMessage(
             console.log(`[crisp] ⚠️ resolveOnReply is enabled for ${sessionId}, but auto-managed replies will stay open to allow follow-up messages`);
           }
         },
-        onError: (err: unknown) => {
+        onError: async (err: unknown) => {
           console.error(`[crisp] ❌ Reply dispatch error:`, err);
+          await sendFallbackOnce("dispatch-onError");
         },
       },
     });
   } catch (err) {
     console.error(`[crisp] ❌ Failed to handle message:`, err);
+    await sendFallbackOnce("handle-message-catch");
+  } finally {
+    clearTimeout(firstReplyTimeout);
   }
 }
 

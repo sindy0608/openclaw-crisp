@@ -291,7 +291,7 @@ async function generateAutoReplyForPending(pending: PendingReply): Promise<strin
   });
 
   let reply = "";
-  const body = `${pending.visitorMessage}${pending.mediaUrl ? " <media:file>" : ""}\n\n${supportContext}`;
+  const body = `${pending.visitorMessage}\n\n${supportContext}`;
 
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: {
@@ -300,7 +300,7 @@ async function generateAutoReplyForPending(pending: PendingReply): Promise<strin
       RawBody: pending.visitorMessage,
       CommandBody: pending.visitorMessage,
       BodyForCommands: pending.visitorMessage,
-      MediaUrl: pending.mediaUrl,
+      MediaUrl: undefined,
       From: `crisp:${pending.crispSessionId}`,
       To: `crisp:${pending.crispSessionId}`,
       SessionKey: `crisp-auto:${pending.accountId}:${pending.crispWebsiteId}:${pending.crispSessionId}`,
