@@ -457,7 +457,7 @@ async function handleInboundMessage(
   // AUTO-REPLY MODE: Send AI response directly
   // =========================================================================
   const FALLBACK_MESSAGE = "抱歉，处理您的消息时遇到了问题，请稍后再试或发送「人工」联系人工客服。";
-  const FIRST_REPLY_TIMEOUT_MS = 15000;
+  const FIRST_REPLY_TIMEOUT_MS = 35000;
   let hasDeliveredReply = false;
   let hasSentFallback = false;
 
@@ -560,6 +560,9 @@ export async function handleCrispWebhookRequest(
     const body = await parseJsonBody(req) as CrispWebhookPayload;
 
     console.log(`[crisp] Received webhook: ${body.event}`);
+    console.log(
+      `[crisp] Webhook detail: event=${body.event} type=${body.data?.type ?? "-"} from=${body.data?.from ?? "-"} session=${body.data?.session_id ?? "-"} website=${body.data?.website_id ?? "-"} content=${JSON.stringify(body.data?.content ?? "")}`
+    );
 
     // Route by event type
     switch (body.event) {
