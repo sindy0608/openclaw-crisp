@@ -5,7 +5,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CrispConfigSchema, type CrispConfig, type ResolvedCrispAccount } from "./types.js";
 import { createCrispClient } from "./api-client.js";
-import { handleCrispWebhookRequest, resolveWebhookPath } from "./monitor.js";
+import { handleCrispWebhookRequest, resolveWebhookPath, startCrispProactiveSweep } from "./monitor.js";
 import { setCrispRuntime } from "./runtime.js";
 
 // Default account ID for single-account setups
@@ -296,8 +296,13 @@ export const crispPlugin = {
       setStatus: (patch: Record<string, unknown>) => void;
       abortSignal: AbortSignal;
     }) => {
-      const { account, runtime, setStatus, abortSignal } = ctx;
+      const { account, runtime, setStatus, abortSignal, cfg } = ctx;
       const webhookPath = resolveWebhookPath(account.config);
+      const stopSweep = startCrispProactiveSweep({
+        config: account.config,
+        clawdbotConfig: cfg as import("clawdbot/plugin-sdk").ClawdbotConfig,
+        accountId: account.accountId,
+      });
 
       runtime.log?.info?.(`[crisp:${account.accountId}] Starting (webhook=${webhookPath})`);
 
@@ -313,6 +318,7 @@ export const crispPlugin = {
       // Webhook channels are passive: keep the channel task alive until OpenClaw aborts it.
       await new Promise<void>((resolve) => {
         const onAbort = () => {
+          stopSweep();
           runtime.log?.info?.(`[crisp:${account.accountId}] Stopping`);
           setStatus({
             accountId: account.accountId,

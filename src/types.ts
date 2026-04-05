@@ -49,6 +49,24 @@ export const CrispConfigSchema = z.object({
   approvalTopicId: z.union([z.string(), z.number().int()]).optional(),
   /** Telegram bot token (from Clawdbot config) */
   telegramBotToken: z.string().optional(),
+  /** Hard timeout for one auto-reply attempt before fixed fallback is sent */
+  autoReplyTimeoutMs: z.number().int().min(1000).max(120000).default(30000),
+  /** Final fallback message used only when no valid auto-reply was sent */
+  autoReplyFailureMessage: z.string().default("抱歉，当前咨询较多，系统处理稍慢，请稍后再发一次，或发送「人工」联系人工客服。"),
+  /** Conservative fallback message used only when dispatch completed with no valid deliver */
+  autoReplyNoValidDeliverMessage: z.string().default("已收到你的消息，我这边先帮你看一下，请稍等。"),
+  /** Conservative fallback message used when dispatch errored before a valid reply reached Crisp */
+  autoReplyDispatchErrorMessage: z.string().default("已收到你的消息，刚刚发送时出现一点延迟，我这边继续帮你处理，请稍等。"),
+  /** Enable conservative proactive conversation sweep for missed webhooks */
+  proactiveSweepEnabled: z.boolean().default(true),
+  /** Sweep interval in milliseconds */
+  proactiveSweepIntervalMs: z.number().int().min(10000).max(3600000).default(60000),
+  /** Only inspect conversations updated within this window */
+  proactiveSweepWindowMs: z.number().int().min(60000).max(86400000).default(600000),
+  /** Max recent conversations fetched per state per sweep */
+  proactiveSweepConversationLimit: z.number().int().min(1).max(100).default(20),
+  /** Max recent messages fetched per conversation during sweep */
+  proactiveSweepMessageLimit: z.number().int().min(2).max(50).default(10),
 });
 
 export type CrispConfig = z.infer<typeof CrispConfigSchema>;
@@ -111,6 +129,7 @@ export interface CrispConversation {
   availability: "online" | "offline";
   created_at: number;
   updated_at: number;
+  inbox_id?: string | null;
   meta: {
     nickname?: string;
     email?: string;
@@ -123,6 +142,19 @@ export interface CrispConversation {
         city?: string;
       };
     };
+  };
+}
+
+export interface CrispConversationListItem {
+  session_id: string;
+  website_id: string;
+  state: "pending" | "unresolved" | "resolved";
+  created_at?: number;
+  updated_at?: number;
+  inbox_id?: string | null;
+  meta?: {
+    nickname?: string;
+    email?: string;
   };
 }
 

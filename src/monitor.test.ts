@@ -318,6 +318,59 @@ describe("handleCrispWebhookRequest", () => {
     expect(getAllPendingReplies()).toHaveLength(1);
   });
 
+  it("sends no-valid-deliver fallback when dispatcher completes without non-empty reply", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async () => {
+      // complete successfully without any deliver callback
+    });
+
+    const req = createRequest(createPayload("session-empty-dispatch", "有人吗"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+      autoReplyNoValidDeliverMessage: "已收到你的消息，我这边先帮你看一下，请稍等。",
+      autoReplyDispatchErrorMessage: "系统稍有延迟，请稍等。",
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const crispCall = vi.mocked(fetch).mock.calls.find(([input, init]) =>
+      String(input).includes('/message') && String(init?.body ?? '').includes('已收到你的消息，我这边先帮你看一下，请稍等。')
+    );
+    expect(crispCall).toBeTruthy();
+  });
+
+  it("does not send fallback if primary send already succeeded", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: '主回复已发出' });
+    });
+
+    const req = createRequest(createPayload("session-primary-ok", "测试一下"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+      autoReplyNoValidDeliverMessage: "不应再发fallback",
+      autoReplyDispatchErrorMessage: "不应再发error fallback",
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const messageCalls = vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('/message'));
+    expect(messageCalls).toHaveLength(1);
+    expect(String(messageCalls[0]?.[1]?.body ?? '')).toContain('主回复已发出');
+  });
+
   it("enables managed mode via #托管 and sends command feedback", async () => {
     const req = createRequest(createPayload("session-command", "#托管"));
     const res = createResponse();

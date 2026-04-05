@@ -6,6 +6,7 @@ import {
   buildCrispApiUrl,
   DEFAULT_TIMEOUT_MS,
   type CrispConversation,
+  type CrispConversationListItem,
   type CrispMessage,
   type CrispSendMessageParams,
 } from "./types.js";
@@ -16,11 +17,30 @@ export interface CrispApiClientOptions {
   timeoutMs?: number;
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRetryableCrispError(err: unknown): boolean {
+  const text = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
+  return /429 Too Many Requests|rate_limited|5\d\d/.test(text);
+}
+
+function normalizeCrispSessionId(sessionId: string): string {
+  return sessionId.startsWith('crisp:') ? sessionId.slice('crisp:'.length) : sessionId;
+}
+
 export interface CrispApiClient {
   /**
    * Send a message to a Crisp conversation
    */
-  sendMessage(params: CrispSendMessageParams): Promise<{ fingerprint: number }>;
+  sendMessage(params: CrispSendMessageParams): Promise<{ fingerprint: number; type?: string; from?: string; origin?: string; content?: string }>;
+
+  /**
+   * List conversations for a website
+   */
+  listConversations(
+    websiteId: string,
+    opts?: { state?: "pending" | "unresolved" | "resolved"; limit?: number; page?: number }
+  ): Promise<CrispConversationListItem[]>;
 
   /**
    * Get conversation details
@@ -104,7 +124,8 @@ export function createCrispClient(opts: CrispApiClientOptions): CrispApiClient {
 
   return {
     async sendMessage(params: CrispSendMessageParams) {
-      const { websiteId, sessionId, content, type = "text" } = params;
+      const { websiteId, content, type = "text" } = params;
+      const sessionId = normalizeCrispSessionId(params.sessionId);
       const path = `/website/${websiteId}/conversation/${sessionId}/message`;
 
       const body = {
@@ -114,12 +135,45 @@ export function createCrispClient(opts: CrispApiClientOptions): CrispApiClient {
         origin: "chat",
       };
 
-      const response = await crispFetch<{ fingerprint: number }>(path, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+      const maxAttempts = 3;
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          if (attempt > 1) {
+            const backoffMs = 350 * attempt;
+            console.warn(`[crisp] 🔁 sendMessage retry attempt=${attempt}/${maxAttempts} session=${sessionId} website=${websiteId} backoffMs=${backoffMs}`);
+            await sleep(backoffMs);
+          }
+          const response = await crispFetch<{ fingerprint: number; type?: string; from?: string; origin?: string; content?: string }>(path, {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
 
-      return { fingerprint: response.fingerprint };
+          return {
+            fingerprint: response.fingerprint,
+            type: response.type,
+            from: response.from,
+            origin: response.origin,
+            content: response.content,
+          };
+        } catch (err) {
+          lastError = err;
+          const retryable = isRetryableCrispError(err);
+          console.warn(`[crisp] ⚠️ sendMessage failed attempt=${attempt}/${maxAttempts} session=${sessionId} website=${websiteId} retryable=${retryable}: ${err instanceof Error ? err.message : String(err)}`);
+          if (!retryable || attempt === maxAttempts) {
+            throw err;
+          }
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    },
+
+    async listConversations(websiteId: string, opts?: { state?: "pending" | "unresolved" | "resolved"; limit?: number; page?: number }) {
+      const state = opts?.state ?? "unresolved";
+      const limit = opts?.limit ?? 20;
+      const page = opts?.page ?? 1;
+      const path = `/website/${websiteId}/conversations?state=${encodeURIComponent(state)}&limit=${limit}&page=${page}`;
+      return crispFetch<CrispConversationListItem[]>(path);
     },
 
     async getConversation(websiteId: string, sessionId: string) {
