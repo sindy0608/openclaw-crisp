@@ -6,6 +6,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import type { ClawdbotConfig } from "clawdbot/plugin-sdk";
 import {
   DEFAULT_WEBHOOK_PATH,
@@ -43,6 +45,8 @@ const sweepProcessedMessages = new Map<string, { messageKey: string; processedAt
 const SWEEP_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_INBOUND_IMAGE_BYTES = 8 * 1024 * 1024;
 const INBOUND_IMAGE_FETCH_TIMEOUT_MS = 10_000;
+const INBOUND_IMAGE_LOCAL_RETENTION_MS = 15 * 60 * 1000;
+const INBOUND_IMAGE_STALE_SWEEP_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 interface NormalizedInboundMessage {
   websiteId: string;
@@ -450,6 +454,62 @@ async function storePendingReplyAndNotify(params: {
   }
 }
 
+async function deleteLocalInboundImage(params: { localPath: string; traceId: string; reason: string }): Promise<void> {
+  const { localPath, traceId, reason } = params;
+  try {
+    await fs.unlink(localPath);
+    console.log(`[crisp] 🧹 Trace ${traceId} deleted local inbound image (${reason}) path=${localPath}`);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} failed to delete local inbound image (${reason}) path=${localPath}: ${err}`);
+    }
+  }
+}
+
+function scheduleInboundImageCleanup(localPath: string, traceId: string): void {
+  const timeout = setTimeout(() => {
+    void deleteLocalInboundImage({
+      localPath,
+      traceId,
+      reason: "retention-expired",
+    });
+  }, INBOUND_IMAGE_LOCAL_RETENTION_MS);
+  timeout.unref?.();
+}
+
+async function sweepStaleInboundImages(localPath: string, traceId: string): Promise<void> {
+  const dir = path.dirname(localPath);
+  const cutoff = Date.now() - INBOUND_IMAGE_STALE_SWEEP_RETENTION_MS;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch (err) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} stale inbound image sweep skipped dir=${dir}: ${err}`);
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    const candidate = path.join(dir, entry);
+    if (candidate === localPath) {
+      return;
+    }
+    try {
+      const stat = await fs.stat(candidate);
+      if (!stat.isFile() || stat.mtimeMs >= cutoff) {
+        return;
+      }
+      await fs.unlink(candidate);
+      console.log(`[crisp] 🧹 Trace ${traceId} swept stale inbound image path=${candidate}`);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT") {
+        console.warn(`[crisp] ⚠️ Trace ${traceId} failed stale inbound image sweep path=${candidate}: ${err}`);
+      }
+    }
+  }));
+}
+
 async function prepareInboundImageMedia(params: {
   core: ReturnType<typeof getCrispRuntime>;
   mediaUrl: string | undefined;
@@ -544,6 +604,8 @@ async function prepareInboundImageMedia(params: {
     );
 
     console.log(`[crisp] 🖼️ Trace ${traceId} inbound image saved for agent media path=${saved.path} contentType=${saved.contentType ?? contentType} bytes=${totalBytes}`);
+    scheduleInboundImageCleanup(saved.path, traceId);
+    void sweepStaleInboundImages(saved.path, traceId);
     return {
       originalUrl,
       localPath: saved.path,
