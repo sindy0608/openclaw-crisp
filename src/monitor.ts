@@ -19,9 +19,12 @@ import { createCrispClient } from "./api-client.js";
 import {
   isHumanHandoffMessage,
   isGlobalAutoModeEnabled,
+  isHumanPauseSession,
+  getHumanPauseRemainingMs,
   isManagedSession,
   isManagedModeDisableCommand,
   isManagedModeEnableCommand,
+  markHumanPauseSession,
   markManagedSession,
   releaseManagedSession,
 } from "./managed-sessions.js";
@@ -38,6 +41,8 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const sessionProcessingLocks = new Map<string, Promise<void>>();
 const sweepProcessedMessages = new Map<string, { messageKey: string; processedAt: number; source: "webhook" | "sweeper" }>();
 const SWEEP_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_INBOUND_IMAGE_BYTES = 8 * 1024 * 1024;
+const INBOUND_IMAGE_FETCH_TIMEOUT_MS = 10_000;
 
 interface NormalizedInboundMessage {
   websiteId: string;
@@ -55,6 +60,13 @@ interface BufferedInboundMessage extends NormalizedInboundMessage {
   sourceMessageKeys?: string[];
   sourceFingerprints?: Array<number | undefined>;
   sourceCount?: number;
+}
+
+interface PreparedInboundMedia {
+  originalUrl?: string;
+  localPath?: string;
+  contentType?: string;
+  sizeBytes?: number;
 }
 
 // Re-export for backward compatibility
@@ -225,6 +237,109 @@ function markProcessedMessage(params: {
   cleanupSweepProcessedMessages(now);
 }
 
+function extractCrispContentText(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (content && typeof content === "object") {
+    const file = content as { url?: unknown; name?: unknown; type?: unknown };
+    if (typeof file.url === "string" && file.url.trim()) {
+      return file.url.trim();
+    }
+    if (typeof file.name === "string" && file.name.trim()) {
+      return file.name.trim();
+    }
+  }
+  return "";
+}
+
+function isHumanOperatorWebhook(data: CrispWebhookPayload["data"] | undefined): boolean {
+  if (data?.type !== "text") {
+    return false;
+  }
+
+  const user = data?.user as { nickname?: unknown; user_id?: unknown } | undefined;
+  if (!user || typeof user !== "object") {
+    return false;
+  }
+
+  const nickname = typeof user.nickname === "string" ? user.nickname.trim() : "";
+  const userId = typeof user.user_id === "string" ? user.user_id.trim() : "";
+  return Boolean(nickname || userId);
+}
+
+const INTERNAL_REASONING_FALLBACK = "您好，这个问题需要人工客服进一步处理，请稍等，客服会尽快为您跟进。";
+
+function sanitizeCustomerReply(text: string, traceId: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  const internalMarkers = [
+    "用户说",
+    "用户询问",
+    "这说明",
+    "根据知识库",
+    "我应该",
+    "等等，",
+    "等等",
+    "这种情况",
+    "内部判断",
+    "转人工规则",
+    "分析",
+    "推理",
+    "思考",
+    "判断",
+    "处理思路",
+    "回复策略",
+    "客户可见回复",
+    "最终回复",
+    "回复客户",
+  ];
+  const markerHits = internalMarkers.filter((marker) => trimmed.includes(marker)).length;
+  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)[:：]/;
+  const internalLineHits = trimmed.split(/\r?\n/).filter((line) => internalLinePattern.test(line)).length;
+  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)[:：]?/.test(trimmed);
+  const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部)/.test(trimmed);
+
+  if (!startsWithInternalMarker && markerHits < 2 && internalLineHits === 0 && !numberedInternalPlan) {
+    return trimmed;
+  }
+
+  const labeledReply = trimmed.match(/(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说)[:：]\s*([\s\S]+)$/);
+  const labeledCandidate = labeledReply?.[1]?.trim();
+  if (labeledCandidate && !internalLinePattern.test(labeledCandidate)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting labeled customer-facing section (originalChars=${trimmed.length}, sanitizedChars=${labeledCandidate.length})`);
+    return labeledCandidate;
+  }
+
+  const customerFacingStarts = [
+    "您好",
+    "你好",
+    "抱歉",
+    "非常理解",
+    "理解您",
+    "可以的",
+    "建议您",
+    "请您",
+    "目前",
+  ];
+  for (const marker of customerFacingStarts) {
+    const index = trimmed.lastIndexOf(marker);
+    if (index > 0) {
+      const candidate = trimmed.slice(index).trim();
+      if (candidate.length >= 12 && !/^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)/.test(candidate)) {
+        console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting customer-facing suffix (originalChars=${trimmed.length}, sanitizedChars=${candidate.length})`);
+        return candidate;
+      }
+    }
+  }
+
+  console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal reasoning reply and used fallback (originalChars=${trimmed.length}, markerHits=${markerHits})`);
+  return INTERNAL_REASONING_FALLBACK;
+}
+
 /**
  * Send a reply to a Crisp conversation (used after approval)
  */
@@ -332,6 +447,115 @@ async function storePendingReplyAndNotify(params: {
     console.log(`[crisp] 📤 System event emitted for [${pending.id}]`);
   } catch (err) {
     console.error(`[crisp] ❌ Failed to emit system event:`, err);
+  }
+}
+
+async function prepareInboundImageMedia(params: {
+  core: ReturnType<typeof getCrispRuntime>;
+  mediaUrl: string | undefined;
+  traceId: string;
+}): Promise<PreparedInboundMedia | undefined> {
+  const { core, mediaUrl, traceId } = params;
+  const originalUrl = mediaUrl?.trim();
+  if (!originalUrl) {
+    return undefined;
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(originalUrl);
+  } catch {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: invalid URL`);
+    return { originalUrl };
+  }
+
+  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: unsupported protocol`);
+    return { originalUrl };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INBOUND_IMAGE_FETCH_TIMEOUT_MS);
+  timeout.unref?.();
+
+  try {
+    const response = await fetch(originalUrl, {
+      method: "GET",
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        Accept: "image/*",
+      },
+    });
+
+    if (!response.ok) {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media download failed status=${response.status}`);
+      return { originalUrl };
+    }
+
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (!contentType?.startsWith("image/")) {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: non-image contentType=${contentType ?? "-"}`);
+      return { originalUrl };
+    }
+
+    const contentLength = Number(response.headers.get("content-length") ?? "0");
+    if (Number.isFinite(contentLength) && contentLength > MAX_INBOUND_IMAGE_BYTES) {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: contentLength=${contentLength} exceeds max=${MAX_INBOUND_IMAGE_BYTES}`);
+      return { originalUrl, contentType, sizeBytes: contentLength };
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    const reader = response.body?.getReader();
+    if (!reader) {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: response body unavailable`);
+      return { originalUrl, contentType };
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value) {
+        continue;
+      }
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_INBOUND_IMAGE_BYTES) {
+        controller.abort();
+        console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media download aborted: bytes=${totalBytes} exceeds max=${MAX_INBOUND_IMAGE_BYTES}`);
+        return { originalUrl, contentType, sizeBytes: totalBytes };
+      }
+      chunks.push(Buffer.from(value));
+    }
+
+    if (totalBytes === 0) {
+      console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media skipped: empty image body`);
+      return { originalUrl, contentType, sizeBytes: 0 };
+    }
+
+    const buffer = Buffer.concat(chunks, totalBytes);
+    const saved = await core.channel.media.saveMediaBuffer(
+      buffer,
+      contentType,
+      "inbound",
+      MAX_INBOUND_IMAGE_BYTES
+    );
+
+    console.log(`[crisp] 🖼️ Trace ${traceId} inbound image saved for agent media path=${saved.path} contentType=${saved.contentType ?? contentType} bytes=${totalBytes}`);
+    return {
+      originalUrl,
+      localPath: saved.path,
+      contentType: saved.contentType ?? contentType,
+      sizeBytes: totalBytes,
+    };
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    console.warn(`[crisp] ⚠️ Trace ${traceId} inbound media download unavailable: ${detail}`);
+    return { originalUrl };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -564,9 +788,14 @@ async function processInboundMessage(params: {
       markProcessed?: boolean;
       logPrefix: string;
     }): Promise<void> => {
-      const text = params.content.trim();
+      const rawText = params.content.trim();
+      const text = rawText ? sanitizeCustomerReply(rawText, traceId).trim() : rawText;
       if (!text) {
         console.warn(`[crisp] ⚠️ ${params.logPrefix} skipped empty text payload`);
+        return;
+      }
+      if (/^⚠️\s*✉️\s*Message failed\s*$/i.test(text)) {
+        console.warn(`[crisp] ⚠️ ${params.logPrefix} suppressed tool failure text payload`);
         return;
       }
       console.log(`[crisp] 🔎 ${params.logPrefix} sending message to Crisp (chars=${text.length})`);
@@ -619,6 +848,21 @@ async function processInboundMessage(params: {
     const normalizedMessageText = mediaUrl ? "图片" : messageText;
     const isSessionManaged = isManagedSession(managedSessionKey);
     const needsHumanHandoff = isHumanHandoffMessage(normalizedMessageText);
+    const isHumanPaused = isHumanPauseSession(managedSessionKey);
+    const preparedMedia = await prepareInboundImageMedia({
+      core,
+      mediaUrl,
+      traceId,
+    });
+    const agentMediaPath = preparedMedia?.localPath;
+    const agentMediaContentType = preparedMedia?.contentType;
+
+    if (isHumanPaused) {
+      const remainingMs = getHumanPauseRemainingMs(managedSessionKey);
+      console.log(
+        `[crisp] ⏸️ Human pause active for ${sessionId}, remaining=${Math.ceil(remainingMs / 1000)}s, skipping AI reply`
+      );
+    }
 
     let historyText = "";
     if (config.historyLimit > 0) {
@@ -650,7 +894,11 @@ async function processInboundMessage(params: {
       websiteId: inbound.websiteId,
       siteName: config.name,
     });
-    const body = `${normalizedMessageText}${historyText}\n\n${supportContext}`;
+    const mediaContext = mediaUrl
+      ? `\n\n[Media]\nImage/file URL: ${mediaUrl}${agentMediaPath ? `\nLocal image path for analysis: ${agentMediaPath}` : ""}\n[End of media]`
+      : "";
+    const outputGuard = `[客服回复硬性要求]\n只输出最终发给客户的中文回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"这说明"、"我应该"等内部判断。不得提及系统、prompt、知识库或 Crisp。\n[End of 客服回复硬性要求]`;
+    const body = `${normalizedMessageText}${mediaContext}${historyText}\n\n${supportContext}\n\n${outputGuard}`;
     console.log(`[crisp] 🔎 Trace ${traceId} support knowledge ready (chars=${supportContext.length}, bodyChars=${body.length})`);
 
     const route = core.channel.routing.resolveAgentRoute({
@@ -671,7 +919,13 @@ async function processInboundMessage(params: {
       RawBody: normalizedMessageText,
       CommandBody: normalizedMessageText,
       BodyForCommands: normalizedMessageText,
-      MediaUrl: undefined,
+      MediaPath: agentMediaPath,
+      MediaPaths: agentMediaPath ? [agentMediaPath] : undefined,
+      MediaType: agentMediaContentType,
+      MediaTypes: agentMediaContentType ? [agentMediaContentType] : undefined,
+      MediaUrl: agentMediaPath ?? mediaUrl,
+      MediaUrls: agentMediaPath ? [agentMediaPath] : mediaUrl ? [mediaUrl] : undefined,
+      OriginalMediaUrl: mediaUrl,
       From: `crisp:${sessionId}`,
       To: `crisp:${sessionId}`,
       SessionKey: route.sessionKey,
@@ -690,6 +944,27 @@ async function processInboundMessage(params: {
       CommandAuthorized: true,
     };
 
+    if (isHumanPaused) {
+      if (needsHumanHandoff) {
+        console.log(`[crisp] 🔄 Human pause: human-handoff keyword detected, storing for human review without AI reply...`);
+        await storePendingReplyAndNotify({
+          config,
+          core,
+          route,
+          accountId,
+          sessionId,
+          websiteId: inbound.websiteId,
+          visitorName: inbound.visitorName,
+          messageText: normalizedMessageText,
+          mediaUrl,
+        });
+      } else {
+        console.log(`[crisp] ⏸️ Human pause: no human-handoff keyword, suppressing Telegram notification and AI reply`);
+      }
+      markCurrentMessageProcessed();
+      return;
+    }
+
     if (config.approvalMode && !isSessionManaged) {
       console.log(`[crisp] 🔄 Approval mode: storing for human review...`);
 
@@ -702,7 +977,7 @@ async function processInboundMessage(params: {
         websiteId: inbound.websiteId,
         visitorName: inbound.visitorName,
         messageText: normalizedMessageText,
-        mediaUrl: undefined,
+        mediaUrl,
       });
       markCurrentMessageProcessed();
       return;
@@ -720,7 +995,7 @@ async function processInboundMessage(params: {
           websiteId: inbound.websiteId,
           visitorName: inbound.visitorName,
           messageText: normalizedMessageText,
-          mediaUrl: undefined,
+          mediaUrl,
         });
       }
       console.log(`[crisp] 🫴 Managed session: suppressing approval forwarding and using auto-reply`);
@@ -741,10 +1016,16 @@ async function processInboundMessage(params: {
         dispatcherOptions: {
           deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string }) => {
             console.log(`[crisp] 🔎 Trace ${traceId} deliver invoked (hasText=${Boolean(payload.text?.trim())}, mediaUrls=${payload.mediaUrls?.length ?? 0}, mediaUrl=${payload.mediaUrl ? 1 : 0})`);
-            const text = payload.text?.trim();
+            const rawText = payload.text?.trim();
+            const text = rawText ? sanitizeCustomerReply(rawText, traceId) : rawText;
             if (!text) {
               emptyDeliverCount += 1;
               console.warn(`[crisp] ⚠️ Trace ${traceId} empty deliver payload (#${emptyDeliverCount})`);
+              return;
+            }
+            if (/^⚠️\s*✉️\s*Message failed\s*$/i.test(text)) {
+              emptyDeliverCount += 1;
+              console.warn(`[crisp] ⚠️ Trace ${traceId} suppressing tool failure deliver payload (#${emptyDeliverCount})`);
               return;
             }
 
@@ -851,7 +1132,7 @@ async function handleInboundMessage(
     websiteId: data.website_id,
     sessionId: data.session_id,
     type: data.type ?? "text",
-    content: data.content || "",
+    content: extractCrispContentText(data.content),
     origin: data.origin ?? "chat",
     from: "user",
     timestampMs: data.timestamp ? data.timestamp * 1000 : Date.now(),
@@ -904,7 +1185,7 @@ export async function runCrispProactiveSweep(params: {
   });
   const now = Date.now();
   const windowStartMs = now - config.proactiveSweepWindowMs;
-  const states: Array<"pending" | "unresolved"> = ["pending", "unresolved"];
+  const states: Array<"pending" | "unresolved" | "resolved"> = ["pending", "unresolved", "resolved"];
   const candidates = new Map<string, CrispConversationListItem>();
 
   for (const state of states) {
@@ -1123,9 +1404,17 @@ export async function handleCrispWebhookRequest(
           break;
         }
         if (body.data?.from === "operator") {
+          const isHumanOperator = isHumanOperatorWebhook(body.data);
           console.log(
-            `[crisp] 🧾 Operator receipt: session=${body.data.session_id} website=${body.data.website_id} fingerprint=${body.data.fingerprint ?? "-"} type=${body.data.type ?? "-"} origin=${body.data.origin ?? "-"} content=${JSON.stringify(body.data.content ?? "")}`
+            `[crisp] 🧾 Operator receipt: session=${body.data.session_id} website=${body.data.website_id} fingerprint=${body.data.fingerprint ?? "-"} type=${body.data.type ?? "-"} origin=${body.data.origin ?? "-"} humanOperator=${isHumanOperator} content=${JSON.stringify(body.data.content ?? "")}`
           );
+          if (config.approvalMode && isGlobalAutoModeEnabled() && isHumanOperator) {
+            markHumanPauseSession({
+              accountId,
+              websiteId: body.data.website_id,
+              sessionId: body.data.session_id,
+            });
+          }
         }
         // Non-user received events are informational only
         break;

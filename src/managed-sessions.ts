@@ -79,6 +79,63 @@ const MANAGED_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 export const GLOBAL_AUTO_MODE_DURATION_MS = 8 * 60 * 60 * 1000;
 const HUMAN_HANDOFF_REGEX = /\b(?:human|agent|support)\b/i;
 
+const humanPauseSessions = new Map<string, number>();
+export const HUMAN_PAUSE_DURATION_MS = 3 * 60 * 1000;
+
+function cleanupHumanPauses(now: number): void {
+  for (const [key, expiresAt] of humanPauseSessions) {
+    if (now > expiresAt) {
+      humanPauseSessions.delete(key);
+    }
+  }
+}
+
+export function markHumanPauseSession(
+  params: ManagedSessionKey,
+  durationMs: number = HUMAN_PAUSE_DURATION_MS
+): void {
+  const now = Date.now();
+  const key = buildManagedSessionKey(params);
+  const expiresAt = now + durationMs;
+  humanPauseSessions.set(key, expiresAt);
+  cleanupHumanPauses(now);
+  console.log(
+    `[crisp] ⏸️ Human pause set for ${key}, expiresAt=${new Date(expiresAt).toISOString()}`
+  );
+}
+
+export function isHumanPauseSession(params: ManagedSessionKey): boolean {
+  const now = Date.now();
+  const key = buildManagedSessionKey(params);
+  const expiresAt = humanPauseSessions.get(key);
+  if (!expiresAt) {
+    return false;
+  }
+  if (now > expiresAt) {
+    humanPauseSessions.delete(key);
+    return false;
+  }
+  return true;
+}
+
+export function getHumanPauseRemainingMs(params: ManagedSessionKey): number {
+  const now = Date.now();
+  const key = buildManagedSessionKey(params);
+  const expiresAt = humanPauseSessions.get(key);
+  if (!expiresAt) {
+    return 0;
+  }
+  if (now > expiresAt) {
+    humanPauseSessions.delete(key);
+    return 0;
+  }
+  return expiresAt - now;
+}
+
+export function releaseHumanPauseSession(params: ManagedSessionKey): boolean {
+  return humanPauseSessions.delete(buildManagedSessionKey(params));
+}
+
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Keep temp-repo state local so test runs do not touch ~/.openclaw.
 const STATE_DIR = path.join(ROOT_DIR, "state");
