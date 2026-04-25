@@ -5,6 +5,25 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CrispConfigSchema, type CrispConfig, type ResolvedCrispAccount } from "./types.js";
 import { createCrispClient } from "./api-client.js";
+
+const INTERNAL_REASONING_FALLBACK = "您好，这个问题需要人工客服进一步处理，请稍等，客服会尽快为您跟进。";
+
+function sanitizeOutboundText(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  if (/^Reasoning:\s*_?Native reasoning was produced; no summary text was returned\.?_?\s*$/i.test(trimmed)) {
+    return INTERNAL_REASONING_FALLBACK;
+  }
+  if (/^Reasoning[:：]/i.test(trimmed) || /Native reasoning was produced/i.test(trimmed)) {
+    return INTERNAL_REASONING_FALLBACK;
+  }
+  if (/^(The user|I need|I should|I will)\b/i.test(trimmed) && /\b(knowledge base|reasoning|final answer|customer-facing)\b/i.test(trimmed)) {
+    return INTERNAL_REASONING_FALLBACK;
+  }
+  return trimmed;
+}
 import { handleCrispWebhookRequest, resolveWebhookPath, startCrispProactiveSweep } from "./monitor.js";
 import { setCrispRuntime } from "./runtime.js";
 
@@ -169,6 +188,13 @@ export const crispPlugin = {
       accountId?: string;
     }) => {
       const { cfg, to, text, accountId } = ctx;
+      const safeText = sanitizeOutboundText(text);
+      if (!safeText) {
+        return { channel: "crisp", ok: true, messageId: "suppressed-empty" };
+      }
+      if (safeText !== text.trim()) {
+        console.warn(`[crisp] ⚠️ Sanitized unsafe outbound text before direct channel send (originalChars=${text.length}, sanitizedChars=${safeText.length})`);
+      }
       const account = resolveCrispAccount({ cfg, accountId });
 
       if (!account.configured) {
@@ -184,7 +210,7 @@ export const crispPlugin = {
         const result = await client.sendMessage({
           websiteId: account.config.websiteId,
           sessionId: to,
-          content: text,
+          content: safeText,
         });
 
         return {
