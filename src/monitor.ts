@@ -272,7 +272,7 @@ function isHumanOperatorWebhook(data: CrispWebhookPayload["data"] | undefined): 
   return Boolean(nickname || userId);
 }
 
-const INTERNAL_REASONING_FALLBACK = "您好，这个问题需要人工客服进一步处理，请稍等，客服会尽快为您跟进。";
+const INTERNAL_REASONING_FALLBACK = "";
 
 function sanitizeCustomerReply(text: string, traceId: string): string {
   const trimmed = text.trim();
@@ -357,7 +357,7 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     }
   }
 
-  console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal reasoning reply and used fallback (originalChars=${trimmed.length}, markerHits=${markerHits})`);
+  console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal reasoning reply (originalChars=${trimmed.length}, markerHits=${markerHits})`);
   return INTERNAL_REASONING_FALLBACK;
 }
 

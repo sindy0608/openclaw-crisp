@@ -6,7 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { CrispConfigSchema, type CrispConfig, type ResolvedCrispAccount } from "./types.js";
 import { createCrispClient } from "./api-client.js";
 
-const INTERNAL_REASONING_FALLBACK = "您好，这个问题需要人工客服进一步处理，请稍等，客服会尽快为您跟进。";
+const INTERNAL_REASONING_FALLBACK = "";
 
 function sanitizeOutboundText(text: string): string {
   const trimmed = text.trim();
