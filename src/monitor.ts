@@ -300,18 +300,28 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     "客户可见回复",
     "最终回复",
     "回复客户",
+    "Reasoning:",
+    "Reasoning",
+    "The user",
+    "the user",
+    "I need",
+    "I should",
+    "I will",
+    "knowledge base",
+    "final answer",
+    "customer-facing",
   ];
   const markerHits = internalMarkers.filter((marker) => trimmed.includes(marker)).length;
-  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)[:：]/;
+  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will|Final answer|Customer-facing reply)[:：]/i;
   const internalLineHits = trimmed.split(/\r?\n/).filter((line) => internalLinePattern.test(line)).length;
-  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)[:：]?/.test(trimmed);
-  const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部)/.test(trimmed);
+  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will)[:：]?/i.test(trimmed);
+  const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部|the user|knowledge base|I should|I need)/i.test(trimmed);
 
   if (!startsWithInternalMarker && markerHits < 2 && internalLineHits === 0 && !numberedInternalPlan) {
     return trimmed;
   }
 
-  const labeledReply = trimmed.match(/(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说)[:：]\s*([\s\S]+)$/);
+  const labeledReply = trimmed.match(/(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|Final answer|Customer-facing reply|Reply to customer)[:：]\s*([\s\S]+)$/i);
   const labeledCandidate = labeledReply?.[1]?.trim();
   if (labeledCandidate && !internalLinePattern.test(labeledCandidate)) {
     console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting labeled customer-facing section (originalChars=${trimmed.length}, sanitizedChars=${labeledCandidate.length})`);
@@ -328,12 +338,19 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     "建议您",
     "请您",
     "目前",
+    "Hello",
+    "Hi",
+    "Sorry",
+    "Thanks",
+    "Thank you",
+    "Please",
+    "You can",
   ];
   for (const marker of customerFacingStarts) {
     const index = trimmed.lastIndexOf(marker);
     if (index > 0) {
       const candidate = trimmed.slice(index).trim();
-      if (candidate.length >= 12 && !/^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略)/.test(candidate)) {
+      if (candidate.length >= 12 && !/^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will)/i.test(candidate)) {
         console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting customer-facing suffix (originalChars=${trimmed.length}, sanitizedChars=${candidate.length})`);
         return candidate;
       }
