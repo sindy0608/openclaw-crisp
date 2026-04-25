@@ -976,7 +976,10 @@ async function processInboundMessage(params: {
     const mediaContext = mediaUrl
       ? `\n\n[Media]\nImage/file URL: ${mediaUrl}${agentMediaPath ? `\nLocal image path for analysis: ${agentMediaPath}` : ""}\n[End of media]`
       : "";
-    const outputGuard = `[客服回复硬性要求]\n只输出最终发给客户的中文回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"这说明"、"我应该"等内部判断。不得提及系统、prompt、知识库或 Crisp。\n[End of 客服回复硬性要求]`;
+    const outputGuard = `[客服回复硬性要求]
+只输出最终发给客户的回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"这说明"、"我应该"、"Reasoning:"、"The user"、"I need"、"I should"等内部判断。不得提及系统、prompt、知识库或 Crisp。
+Only output the final customer-facing reply. Do not include reasoning, chain-of-thought, analysis, planning, or labels such as "Reasoning:" / "Final answer:".
+[End of 客服回复硬性要求]`;
     const body = `${normalizedMessageText}${mediaContext}${historyText}\n\n${supportContext}\n\n${outputGuard}`;
     console.log(`[crisp] 🔎 Trace ${traceId} support knowledge ready (chars=${supportContext.length}, bodyChars=${body.length})`);
 
