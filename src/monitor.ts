@@ -46,6 +46,7 @@ const sessionProcessingLocks = new Map<string, Promise<void>>();
 const activeAutoRepliesByAccount = new Map<string, number>();
 type PendingAutoReplySlot = { resolve: (release: () => void) => void };
 const pendingAutoReplySlotsByAccount = new Map<string, PendingAutoReplySlot[]>();
+const proactiveSweepRescueCooldowns = new Map<string, number>();
 const sweepProcessedMessages = new Map<string, { messageKey: string; processedAt: number; source: "webhook" | "sweeper" }>();
 const recentOperatorReplies = new Map<string, { at: number; fingerprint?: number; content: string }>();
 const SWEEP_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -487,7 +488,7 @@ function startsWithInternalReasoningHeading(text: string): boolean {
 }
 
 function isInternalDecisionRecord(text: string): boolean {
-  return /^\s*(?:[-*]\s*)?(?:用户说|用户询问|用户想要|客户说|客户询问|这说明|根据知识库|知识库显示|我应该|我需要|我会|应该|需要确认|需要判断|看起来|这种情况|内部判断|内部决策|决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|We need|Need to|Final answer|Customer-facing reply)[:：]/i.test(text.trim());
+  return /^\s*(?:[-*]\s*)?(?:用户说|用户再次抱怨|用户抱怨|用户询问|用户想要|客户说|客户再次抱怨|客户抱怨|客户询问|这说明|这意味着|结合之前|根据知识库|知识库显示|我应该|我需要|我会|应该|需要确认|需要判断|看起来|这种情况|内部判断|内部决策|决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|We need|Need to|Final answer|Customer-facing reply)[:：]/i.test(text.trim());
 }
 
 function isLikelyInternalMonologueParagraph(text: string): boolean {
@@ -532,6 +533,52 @@ function isLikelyInternalMonologueParagraph(text: string): boolean {
   return hits >= 4 && /我|用户|客户/.test(normalized) && /应该|需要|看起来|确认|判断|分析|推理|思考|可能/.test(normalized);
 }
 
+function isLikelyEnglishInternalMonologue(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 80) {
+    return false;
+  }
+  if (!/^[A-Za-z]/.test(trimmed)) {
+    return false;
+  }
+
+  const markers = [
+    /\bThe user said\b/i,
+    /\bThe user is (?:asking|reporting|saying|referring|trying|likely)\b/i,
+    /\bThe user might be\b/i,
+    /\bThe customer (?:said|is|might|asked|wants|needs)\b/i,
+    /\bLooking at the (?:context|knowledge base|conversation|previous messages|previous conversation)\b/i,
+    /\bFrom the knowledge base\b/i,
+    /\bBased on the (?:context|knowledge base|conversation|information|above|messages)\b/i,
+    /\bI need to\b/i,
+    /\bI should\b/i,
+    /\bI will\b/i,
+    /\bI think (?:the user|the customer|they|we should|I should|this is|it is|this means|it means)\b/i,
+    /\bWait[,，]\b/,
+    /\bActually[,，]\b/,
+    /\bIn summary[,，:]\b/i,
+    /\bThis is a (?:Mielink|Crisp|customer|user|client|standard|common|typical)\b/i,
+  ];
+
+  let hits = 0;
+  for (const marker of markers) {
+    if (marker.test(trimmed)) {
+      hits += 1;
+    }
+  }
+
+  if (hits >= 3) {
+    return true;
+  }
+
+  if (trimmed.length > 150 &&
+      /^(?:The user said|The user is asking|The user is reporting|The user might be|I need to check|I should just answer|I should provide guidance|Looking at the context|Based on the)/i.test(trimmed)) {
+    return true;
+  }
+
+  return false;
+}
+
 function removeInternalReasoningBlocks(text: string, traceId: string): string {
   const paragraphs = text.split(/\n{2,}/);
   const kept: string[] = [];
@@ -549,7 +596,7 @@ function removeInternalReasoningBlocks(text: string, traceId: string): string {
       continue;
     }
 
-    if (isInternalReasoningHeading(trimmedParagraph) || startsWithInternalReasoningHeading(trimmedParagraph) || isInternalDecisionRecord(trimmedParagraph) || isLikelyInternalMonologueParagraph(trimmedParagraph)) {
+    if (isInternalReasoningHeading(trimmedParagraph) || startsWithInternalReasoningHeading(trimmedParagraph) || isInternalDecisionRecord(trimmedParagraph) || isLikelyInternalMonologueParagraph(trimmedParagraph) || isLikelyEnglishInternalMonologue(trimmedParagraph)) {
       dropping = true;
       droppedCount += 1;
       continue;
@@ -590,9 +637,12 @@ function isUsableCustomerReply(text: string): boolean {
   if (/^(您好|你好|亲|亲爱的|尊敬的客户|感谢您的咨询|请稍等|我们会尽快回复|已收到您的消息)[。.!！~～]*$/i.test(normalized)) {
     return false;
   }
-  if (isInternalReasoningHeading(text) || isInternalDecisionRecord(text) || isLikelyInternalMonologueParagraph(text)) {
+  if (isInternalReasoningHeading(text) || isInternalDecisionRecord(text)) {
     return false;
   }
+  // Note: isLikelyInternalMonologueParagraph is too aggressive for normal customer-
+  // support answers; it was dropping legitimate fallback replies.  Rely on the line
+  // and block-based filters in sanitizeCustomerReply instead.
   return true;
 }
 
@@ -606,7 +656,7 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     return SAFE_VISIBLE_FALLBACK_MESSAGE;
   }
 
-  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|Final answer|Customer-facing reply)[:：]/i;
+  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户再次抱怨|用户抱怨|用户询问|这说明|这意味着|结合之前|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|Final answer|Customer-facing reply)[:：]/i;
 
   const labeledReply = trimmed.match(/(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|Final answer|Customer-facing reply|Reply to customer)[:：]\s*([\s\S]+)$/i);
   const labeledCandidate = labeledReply?.[1]?.trim();
@@ -634,7 +684,7 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
 
   const lines = trimmed.split(/\r?\n/);
   const internalLineHits = lines.filter((line) => internalLinePattern.test(line)).length;
-  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will)[:：]/i.test(trimmed);
+  const startsWithInternalMarker = /^(用户说|用户再次抱怨|用户抱怨|用户询问|这说明|这意味着|结合之前|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will)[:：]/i.test(trimmed);
   const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部|the user|knowledge base|I should|I need)/i.test(trimmed);
   const explicitReasoningBlock = /(?:^|\n)\s*(?:分析|推理|思考|处理思路|回复策略|Reasoning)[:：]\s*\S[\s\S]*(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|Final answer|Customer-facing reply)[:：]/i.test(trimmed);
 
@@ -647,9 +697,15 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     return INTERNAL_REASONING_FALLBACK;
   }
 
+  // Hard guard: English model monologue that leaked through core reasoning filtering.
+  if (isLikelyEnglishInternalMonologue(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed English model internal monologue (The user said/Looking at the context/I should)`);
+    return INTERNAL_REASONING_FALLBACK;
+  }
+
   // Hard guard: Chinese model paraphrasing/reasoning that starts with "用户反馈" or "用户问：" or "客户问：" or contains "这通常是"
-  if (/^\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问)[\s\S]{0,300}/i.test(trimmed) ||
-      /^\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\s\S]{0,300}/i.test(trimmed)) {
+  if (/^\s*(?:用户反馈|客户反馈|用户说|用户再次抱怨|用户抱怨|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问)[\s\S]{0,300}/i.test(trimmed) ||
+      /^\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这意味着|这看起来是|该问题通常|该情况通常|此类问题通常|结合之前|用户情绪)[\s\S]{0,300}/i.test(trimmed)) {
     console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed Chinese model paraphrase/reasoning (用户反馈/用户问/这通常是)`);
     return INTERNAL_REASONING_FALLBACK;
   }
@@ -675,9 +731,13 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
   }
 
   // Suppress any remaining OpenClaw internal meta / fallback status messages.
-  const internalMetaPattern = /^(?:Model Fallback|Fallback|selected\s+[\w\/._-]+\s*[:;]|\(?[\w\s\/]+timeout\)?)/i;
+  const internalMetaPattern = /^(?:↪️\s*)?(?:Model Fallback|Fallback|selected\s+[\w\/._-]+\s*[:;]|\(?[\w\s\/]+timeout\)?)/i;
   if (internalMetaPattern.test(trimmed)) {
     console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal meta/fallback status message`);
+    return SAFE_VISIBLE_FALLBACK_MESSAGE;
+  }
+  if (/↪️\s*Model Fallback/i.test(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed OpenClaw fallback notice`);
     return SAFE_VISIBLE_FALLBACK_MESSAGE;
   }
 
@@ -964,6 +1024,10 @@ async function prepareInboundImageMedia(params: {
 /**
  * Handle inbound message from Crisp
  */
+function isSessionProcessingLocked(sessionKey: string): boolean {
+  return sessionProcessingLocks.has(sessionKey);
+}
+
 async function runWithSessionProcessingLock(
   sessionKey: string,
   fn: () => Promise<void>
@@ -1329,8 +1393,8 @@ async function processInboundMessage(params: {
       ? `\n\n[Media]\nImage/file URL: ${mediaUrl}${agentMediaPath ? `\nLocal image path for analysis: ${agentMediaPath}` : ""}\n[End of media]`
       : "";
     const outputGuard = `[客服回复硬性要求]
-只输出最终发给客户的回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"这说明"、"我应该"、"Reasoning:"、"The user"、"I need"、"I should"等内部判断。不得提及系统、prompt、知识库或 Crisp。
-Only output the final customer-facing reply. Do not include reasoning, chain-of-thought, analysis, planning, or labels such as "Reasoning:" / "Final answer:".
+只输出最终发给客户的回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"用户抱怨"、"用户再次抱怨"、"这说明"、"这意味着"、"结合之前"、"我应该"、"Reasoning:"、"The user"、"I need"、"I should"等内部判断。不要分析用户情绪、不要总结用户问题、不要引用之前的对话内容。不得提及系统、prompt、知识库或 Crisp。
+Only output the final customer-facing reply. Do not include reasoning, chain-of-thought, analysis, planning, user emotion summaries, paraphrasing of the user's message, or labels such as "Reasoning:" / "Final answer:".
 [End of 客服回复硬性要求]`;
     const body = buildLightweightPromptBody({
       normalizedMessageText,
@@ -1904,6 +1968,13 @@ export async function runCrispProactiveSweep(params: {
   const states = config.proactiveSweepStates;
   const candidates = new Map<string, CrispConversationListItem>();
 
+  // Clean up stale rescue cooldowns to prevent unbounded Map growth.
+  for (const [key, ts] of proactiveSweepRescueCooldowns.entries()) {
+    if (now - ts > config.proactiveSweepRescueCooldownMs) {
+      proactiveSweepRescueCooldowns.delete(key);
+    }
+  }
+
   for (const state of states) {
     try {
       const conversations = await client.listConversations(config.websiteId, {
@@ -1957,6 +2028,24 @@ export async function runCrispProactiveSweep(params: {
         continue;
       }
 
+      const messageAgeMs = now - latestMessageTsMs;
+      if (messageAgeMs < config.proactiveSweepRescueDelayMs) {
+        addSkipReason("message_too_recent", `session=${conversation.session_id} ageMs=${messageAgeMs} delayMs=${config.proactiveSweepRescueDelayMs}`);
+        continue;
+      }
+
+      const sessionLocked = isSessionProcessingLocked(sessionKey);
+      if (sessionLocked) {
+        addSkipReason("session_locked", `session=${conversation.session_id}`);
+        continue;
+      }
+
+      const lastRescueMs = proactiveSweepRescueCooldowns.get(sessionKey) ?? 0;
+      if (now - lastRescueMs < config.proactiveSweepRescueCooldownMs) {
+        addSkipReason("rescue_cooldown", `session=${conversation.session_id} cooldownMs=${config.proactiveSweepRescueCooldownMs}`);
+        continue;
+      }
+
       const operatorTextReply = messages.some((message) =>
         message.from === "operator" &&
         message.type === "text" &&
@@ -2000,6 +2089,7 @@ export async function runCrispProactiveSweep(params: {
           visitorName: latestUserMessage.user?.nickname || conversation.meta?.nickname || "Visitor",
         },
       });
+      proactiveSweepRescueCooldowns.set(sessionKey, now);
       rescuedSessions.push(conversation.session_id);
       if (rescuedSessions.length >= config.proactiveSweepMaxRescuesPerTick) {
         addSkipReason("max_rescues_reached", `limit=${config.proactiveSweepMaxRescuesPerTick}`);

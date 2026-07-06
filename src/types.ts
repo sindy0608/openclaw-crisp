@@ -56,7 +56,7 @@ export const CrispConfigSchema = z.object({
   /** Telegram bot token (from Clawdbot config) */
   telegramBotToken: z.string().optional(),
   /** Hard timeout for one auto-reply attempt before fixed fallback is sent */
-  autoReplyTimeoutMs: z.number().int().min(1000).max(120000).default(60000),
+  autoReplyTimeoutMs: z.number().int().min(1000).max(180000).default(120000),
   /** Max concurrent AI auto-reply attempts for this Crisp account. Extra messages are routed to human review instead of piling up in Gateway. */
   autoReplyMaxConcurrent: z.number().int().min(1).max(20).default(2),
   /** Max time to wait for an auto-reply concurrency slot before using the safe fallback/human path. This is separate from autoReplyTimeoutMs. */
@@ -86,6 +86,10 @@ export const CrispConfigSchema = z.object({
     .default(["pending", "unresolved"]),
   /** Max sessions rescued per sweep tick. Prevents missed-message recovery from monopolizing the gateway. */
   proactiveSweepMaxRescuesPerTick: z.number().int().min(1).max(20).default(3),
+  /** Delay before a message is eligible for rescue (avoids racing normal webhook). */
+  proactiveSweepRescueDelayMs: z.number().int().min(0).max(600000).default(30000),
+  /** Cooldown before a previously rescued session can be rescued again. */
+  proactiveSweepRescueCooldownMs: z.number().int().min(0).max(3600000).default(300000),
 });
 
 export type CrispConfig = z.infer<typeof CrispConfigSchema>;
