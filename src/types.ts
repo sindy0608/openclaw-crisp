@@ -37,6 +37,12 @@ export const CrispConfigSchema = z.object({
   notifyTarget: z.string().optional(),
   /** Messages to include as AI context */
   historyLimit: z.number().int().min(0).max(50).default(10),
+  /** Rotate the OpenClaw agent session key for Crisp auto-replies to prevent unbounded transcript growth. Set 0 to disable. */
+  autoReplySessionWindowMs: z.number().int().min(0).max(86400000).default(30 * 60 * 1000),
+  /** Max characters per historical Crisp message before passing it to the agent. */
+  historyMessageMaxChars: z.number().int().min(200).max(5000).default(1200),
+  /** Max total characters in the agent-visible Crisp prompt body. */
+  agentContextMaxChars: z.number().int().min(5000).max(120000).default(60000),
   /** Mark conversation resolved after reply */
   resolveOnReply: z.boolean().default(false),
   /** Human-in-the-loop approval mode: send to Telegram for approval before replying */
@@ -50,13 +56,19 @@ export const CrispConfigSchema = z.object({
   /** Telegram bot token (from Clawdbot config) */
   telegramBotToken: z.string().optional(),
   /** Hard timeout for one auto-reply attempt before fixed fallback is sent */
-  autoReplyTimeoutMs: z.number().int().min(1000).max(120000).default(30000),
+  autoReplyTimeoutMs: z.number().int().min(1000).max(120000).default(60000),
+  /** Max concurrent AI auto-reply attempts for this Crisp account. Extra messages are routed to human review instead of piling up in Gateway. */
+  autoReplyMaxConcurrent: z.number().int().min(1).max(20).default(2),
+  /** Max time to wait for an auto-reply concurrency slot before using the safe fallback/human path. This is separate from autoReplyTimeoutMs. */
+  autoReplySlotWaitTimeoutMs: z.number().int().min(0).max(60000).default(5000),
+  /** Archive and delete local yingge session transcripts when Crisp session state becomes resolved. */
+  crispSessionCleanupOnResolved: z.boolean().default(true),
   /** Final fallback message used only when no valid auto-reply was sent */
-  autoReplyFailureMessage: z.string().default("抱歉，当前咨询较多，系统处理稍慢，请稍后再发一次，或发送「人工」联系人工客服。"),
-  /** Conservative fallback message used only when dispatch completed with no valid deliver */
-  autoReplyNoValidDeliverMessage: z.string().default("已收到你的消息，我这边先帮你看一下，请稍等。"),
-  /** Conservative fallback message used when dispatch errored before a valid reply reached Crisp */
-  autoReplyDispatchErrorMessage: z.string().default("已收到你的消息，刚刚发送时出现一点延迟，我这边继续帮你处理，请稍等。"),
+  autoReplyFailureMessage: z.string().default(""),
+  /** Conservative fallback message used only when dispatch completed with no valid deliver. Runtime also has a built-in fallback if this is configured empty. */
+  autoReplyNoValidDeliverMessage: z.string().default(""),
+  /** Conservative fallback message used when dispatch errored before a valid reply reached Crisp. Runtime also has a built-in fallback if this is configured empty. */
+  autoReplyDispatchErrorMessage: z.string().default(""),
   /** Enable conservative proactive conversation sweep for missed webhooks */
   proactiveSweepEnabled: z.boolean().default(true),
   /** Sweep interval in milliseconds */
@@ -67,6 +79,13 @@ export const CrispConfigSchema = z.object({
   proactiveSweepConversationLimit: z.number().int().min(1).max(100).default(20),
   /** Max recent messages fetched per conversation during sweep */
   proactiveSweepMessageLimit: z.number().int().min(2).max(50).default(10),
+  /** Conversation states inspected by the proactive sweeper. Avoid resolved by default to keep recovery cheap. */
+  proactiveSweepStates: z
+    .array(z.enum(["pending", "unresolved", "resolved"]))
+    .min(1)
+    .default(["pending", "unresolved"]),
+  /** Max sessions rescued per sweep tick. Prevents missed-message recovery from monopolizing the gateway. */
+  proactiveSweepMaxRescuesPerTick: z.number().int().min(1).max(20).default(3),
 });
 
 export type CrispConfig = z.infer<typeof CrispConfigSchema>;

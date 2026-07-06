@@ -6,7 +6,82 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { CrispConfigSchema, type CrispConfig, type ResolvedCrispAccount } from "./types.js";
 import { createCrispClient } from "./api-client.js";
 
-const INTERNAL_REASONING_FALLBACK = "";
+const SAFE_VISIBLE_FALLBACK_MESSAGE = "";
+const INTERNAL_REASONING_FALLBACK = SAFE_VISIBLE_FALLBACK_MESSAGE;
+const CRISP_TARGET_PREFIX = "crisp:";
+
+function parseCrispTarget(raw: string): {
+  accountId?: string;
+  websiteId?: string;
+  sessionId: string;
+} | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (!trimmed.toLowerCase().startsWith(CRISP_TARGET_PREFIX)) {
+    const legacyParts = trimmed.split(":");
+    if (legacyParts.length >= 3) {
+      const [accountId, websiteId, ...sessionParts] = legacyParts;
+      const sessionId = sessionParts.join(":").trim();
+      if (accountId.trim() && websiteId.trim() && /^session_[A-Za-z0-9_-]+$/.test(sessionId)) {
+        return { accountId: accountId.trim(), websiteId: websiteId.trim(), sessionId };
+      }
+    }
+    return { sessionId: trimmed };
+  }
+
+  const remainder = trimmed.slice(CRISP_TARGET_PREFIX.length);
+  const parts = remainder.split(":");
+  if (parts.length >= 3) {
+    const [accountId, websiteId, ...sessionParts] = parts;
+    const sessionId = sessionParts.join(":").trim();
+    if (accountId.trim() && websiteId.trim() && sessionId) {
+      return {
+        accountId: accountId.trim(),
+        websiteId: websiteId.trim(),
+        sessionId,
+      };
+    }
+  }
+
+  const sessionId = remainder.trim();
+  return sessionId ? { sessionId } : null;
+}
+
+function looksLikeCrispSessionId(value: string): boolean {
+  const trimmed = value.trim();
+  return /^crisp:/i.test(trimmed) || /^session_[A-Za-z0-9_-]+$/.test(trimmed) || /^[A-Za-z0-9_-]+:[0-9a-f-]{36}:session_[A-Za-z0-9_-]+$/i.test(trimmed);
+}
+
+function readActionString(params: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = params[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function resolveCrispActionTarget(params: {
+  rawTarget?: string;
+  currentChannelId?: string;
+}): string | undefined {
+  const raw = params.rawTarget?.trim();
+  const current = params.currentChannelId?.trim();
+  if (raw && looksLikeCrispSessionId(raw)) {
+    return raw;
+  }
+  if (raw && !looksLikeCrispSessionId(raw) && current && looksLikeCrispSessionId(current)) {
+    console.warn(`[crisp] ⚠️ Rewriting invalid Crisp action target ${JSON.stringify(raw)} to current session target`);
+    return current;
+  }
+  if (current && looksLikeCrispSessionId(current)) {
+    return current;
+  }
+  return raw;
+}
 
 function sanitizeOutboundText(text: string): string {
   const trimmed = text.trim();
@@ -134,10 +209,59 @@ export const crispPlugin = {
   },
 
   threading: {
-    buildToolContext: ({ context }: { context: Record<string, unknown>; hasRepliedRef?: boolean }) => ({
+    buildToolContext: ({ context, hasRepliedRef }: { context: Record<string, unknown>; hasRepliedRef?: { value: boolean } }) => ({
       currentChannelId: (context.To as string)?.trim() || undefined,
       currentThreadTs: context.ReplyToId as string | undefined,
+      hasRepliedRef,
     }),
+  },
+
+  messaging: {
+    normalizeTarget: (target: string) => {
+      const parsed = parseCrispTarget(target);
+      return parsed?.sessionId;
+    },
+    targetResolver: {
+      hint: "Use a Crisp session id (session_xxx) or crisp:<account>:<website>:<session>.",
+      looksLikeId: (raw: string) => looksLikeCrispSessionId(raw),
+    },
+  },
+
+  actions: {
+    supportsAction: ({ action }: { action: string }) => action === "send",
+    handleAction: async ({ action, params, cfg, accountId, toolContext }: {
+      action: string;
+      params: Record<string, unknown>;
+      cfg: Record<string, unknown>;
+      accountId?: string;
+      toolContext?: { currentChannelId?: string; hasRepliedRef?: { value: boolean } };
+    }) => {
+      if (action !== "send") return null;
+      const rawTarget = readActionString(params, "target", "to", "channelId", "chatId");
+      const target = resolveCrispActionTarget({
+        rawTarget,
+        currentChannelId: toolContext?.currentChannelId,
+      });
+      const message = readActionString(params, "message", "text", "content", "caption");
+      const mediaUrl = readActionString(params, "media", "mediaUrl", "filePath", "path");
+      if (!target) {
+        return { channel: "crisp", ok: false, error: "Crisp send requires a session target or current Crisp context" };
+      }
+      if (!message && !mediaUrl) {
+        return { channel: "crisp", ok: false, error: "Crisp send requires message or media" };
+      }
+      let result: { channel: string; ok: boolean; messageId?: string; error?: string } | undefined;
+      if (message) {
+        result = await crispPlugin.outbound.sendText({ cfg, to: target, text: message, accountId });
+      }
+      if (mediaUrl) {
+        result = await crispPlugin.outbound.sendMedia({ cfg, to: target, mediaUrl, accountId });
+      }
+      if (result?.ok && toolContext?.hasRepliedRef) {
+        toolContext.hasRepliedRef.value = true;
+      }
+      return result ?? { channel: "crisp", ok: false, error: "Crisp send did not run" };
+    },
   },
 
   reload: {
@@ -171,14 +295,14 @@ export const crispPlugin = {
     textChunkLimit: 4000,
 
     resolveTarget: ({ to }: { to?: string }) => {
-      const trimmed = to?.trim();
-      if (!trimmed) {
+      const parsed = to ? parseCrispTarget(to) : null;
+      if (!parsed?.sessionId) {
         return {
           ok: false as const,
           error: new Error("Crisp requires --to <session_id>"),
         };
       }
-      return { ok: true as const, to: trimmed };
+      return { ok: true as const, to: parsed.sessionId };
     },
 
     sendText: async (ctx: {
@@ -195,7 +319,9 @@ export const crispPlugin = {
       if (safeText !== text.trim()) {
         console.warn(`[crisp] ⚠️ Sanitized unsafe outbound text before direct channel send (originalChars=${text.length}, sanitizedChars=${safeText.length})`);
       }
-      const account = resolveCrispAccount({ cfg, accountId });
+      const target = parseCrispTarget(to);
+      const resolvedAccountId = target?.accountId ?? accountId;
+      const account = resolveCrispAccount({ cfg, accountId: resolvedAccountId });
 
       if (!account.configured) {
         return { channel: "crisp", ok: false, error: "Crisp not configured" };
@@ -208,8 +334,8 @@ export const crispPlugin = {
 
       try {
         const result = await client.sendMessage({
-          websiteId: account.config.websiteId,
-          sessionId: to,
+          websiteId: target?.websiteId ?? account.config.websiteId,
+          sessionId: target?.sessionId ?? to,
           content: safeText,
         });
 
@@ -234,7 +360,9 @@ export const crispPlugin = {
       accountId?: string;
     }) => {
       const { cfg, to, mediaUrl, accountId } = ctx;
-      const account = resolveCrispAccount({ cfg, accountId });
+      const target = parseCrispTarget(to);
+      const resolvedAccountId = target?.accountId ?? accountId;
+      const account = resolveCrispAccount({ cfg, accountId: resolvedAccountId });
 
       if (!account.configured) {
         return { channel: "crisp", ok: false, error: "Crisp not configured" };
@@ -247,8 +375,8 @@ export const crispPlugin = {
 
       try {
         const result = await client.sendMessage({
-          websiteId: account.config.websiteId,
-          sessionId: to,
+          websiteId: target?.websiteId ?? account.config.websiteId,
+          sessionId: target?.sessionId ?? to,
           content: mediaUrl,
           type: "file",
         });

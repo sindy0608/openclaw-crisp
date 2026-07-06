@@ -2,7 +2,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { markIgnoredSession, releaseIgnoredSession } from "./ignored-sessions.js";
-import { handleCrispWebhookRequest } from "./monitor.js";
+import { flushCrispInboundDebounceForTests, handleCrispWebhookRequest } from "./monitor.js";
 import { setCrispRuntime } from "./runtime.js";
 import {
   findPendingReplyByTelegramMessage,
@@ -15,7 +15,9 @@ import {
   disableGlobalAutoMode,
   enableGlobalAutoMode,
   isManagedSession,
+  markHumanPauseSession,
   markManagedSession,
+  releaseHumanPauseSession,
   releaseManagedSession,
 } from "./managed-sessions.js";
 import type { CrispConfig, CrispWebhookPayload } from "./types.js";
@@ -33,8 +35,24 @@ function createConfig(): CrispConfig {
     operatorName: "Assistant",
     notifyOnNew: false,
     historyLimit: 0,
+    autoReplySessionWindowMs: 0,
+    historyMessageMaxChars: 1200,
+    agentContextMaxChars: 60000,
     resolveOnReply: false,
     approvalMode: true,
+    autoReplyTimeoutMs: 60000,
+    autoReplyMaxConcurrent: 2,
+    autoReplySlotWaitTimeoutMs: 5000,
+    autoReplyFailureMessage: "抱歉，当前咨询较多，系统处理稍慢，请稍后再发一次。",
+    autoReplyNoValidDeliverMessage: "您好，当前系统回复生成异常，请稍等，我帮您转人工处理。",
+    autoReplyDispatchErrorMessage: "您好，当前系统回复生成异常，请稍等，我帮您转人工处理。",
+    proactiveSweepEnabled: true,
+    proactiveSweepIntervalMs: 60000,
+    proactiveSweepWindowMs: 600000,
+    proactiveSweepConversationLimit: 20,
+    proactiveSweepMessageLimit: 10,
+    proactiveSweepStates: ["pending", "unresolved"],
+    proactiveSweepMaxRescuesPerTick: 3,
   };
 }
 
@@ -204,6 +222,11 @@ describe("handleCrispWebhookRequest", () => {
       websiteId: "123e4567-e89b-12d3-a456-426614174000",
       sessionId: "session-disable",
     });
+    releaseHumanPauseSession({
+      accountId: "site1",
+      websiteId: "123e4567-e89b-12d3-a456-426614174000",
+      sessionId: "session-human-pause",
+    });
     releaseIgnoredSession({
       accountId: "site1",
       websiteId: "123e4567-e89b-12d3-a456-426614174000",
@@ -212,16 +235,47 @@ describe("handleCrispWebhookRequest", () => {
   });
 
   it("defaults new conversations to managed mode while global auto mode is enabled", async () => {
+    enableGlobalAutoMode();
     const req = createRequest(createPayload("session-approval", "我想咨询套餐"));
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
     expect(dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    expect(dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0].ctx).toMatchObject({
+      To: "crisp:site1:123e4567-e89b-12d3-a456-426614174000:session-approval",
+      OriginatingTo: "crisp:site1:123e4567-e89b-12d3-a456-426614174000:session-approval",
+      AccountId: "site1",
+      CrispAccountId: "site1",
+      CrispWebsiteId: "123e4567-e89b-12d3-a456-426614174000",
+      CrispSessionId: "session-approval",
+      DeliveryTarget: "crisp:site1:123e4567-e89b-12d3-a456-426614174000:session-approval",
+    });
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
     expect(getAllPendingReplies()).toHaveLength(0);
+  });
+
+  it("uses a rolling lightweight agent session key when configured", async () => {
+    enableGlobalAutoMode();
+    const payload = createPayload("session-rolling", "我想咨询套餐");
+    payload.data.timestamp = 1_700_000_000;
+    const req = createRequest(payload);
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReplySessionWindowMs: 60_000,
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const expectedWindow = Math.floor(1_700_000_000_000 / 60_000);
+    expect(dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0].ctx.SessionKey).toBe(`crisp:session:w${expectedWindow}`);
   });
 
   it("suppresses Telegram approval forwarding for ignored sessions", async () => {
@@ -234,10 +288,12 @@ describe("handleCrispWebhookRequest", () => {
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
     expect(dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    expect(resolveAgentRoute).not.toHaveBeenCalled();
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
     expect(getAllPendingReplies()).toHaveLength(0);
     expect(fetch).not.toHaveBeenCalledWith(
@@ -258,6 +314,7 @@ describe("handleCrispWebhookRequest", () => {
     };
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
@@ -310,12 +367,37 @@ describe("handleCrispWebhookRequest", () => {
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
     expect(dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
     expect(getAllPendingReplies()).toHaveLength(1);
+  });
+
+  it("skips no-valid fallback when the agent replied via the Crisp message tool", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      replyOptions.hasRepliedRef.value = true;
+    });
+
+    const req = createRequest(createPayload("session-tool-replied", "有人吗"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const crispCalls = vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('/message'));
+    expect(crispCalls).toHaveLength(0);
   });
 
   it("sends no-valid-deliver fallback when dispatcher completes without non-empty reply", async () => {
@@ -336,13 +418,139 @@ describe("handleCrispWebhookRequest", () => {
     };
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
-    const crispCall = vi.mocked(fetch).mock.calls.find(([input, init]) =>
-      String(input).includes('/message') && String(init?.body ?? '').includes('已收到你的消息，我这边先帮你看一下，请稍等。')
-    );
+    const crispCall = vi.mocked(fetch).mock.calls.find(([input]) => String(input).includes('/message'));
     expect(crispCall).toBeTruthy();
+  });
+
+  it("notifies human review instead of sending a built-in customer-visible fallback when no-valid config is empty", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async () => {
+      // complete successfully without any deliver callback
+    });
+
+    const req = createRequest(createPayload("session-empty-config-fallback", "有人吗"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+      autoReplyNoValidDeliverMessage: "",
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const crispCall = vi.mocked(fetch).mock.calls.find(([input]) => String(input).includes('/message'));
+    expect(crispCall).toBeUndefined();
+    expect(getAllPendingReplies()).toHaveLength(1);
+    expect(enqueueSystemEvent).toHaveBeenCalled();
+  });
+
+  it("does not suppress normal customer replies that mention 判断 or 分析", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "目前判断更像是节点链路异常，不是您本地设置的问题。建议先切换到其他可用节点测试，我这边也会继续协助排查。" });
+    });
+
+    const req = createRequest(createPayload("session-normal-judgement", "其他节点也不正常"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+      autoReplyNoValidDeliverMessage: "不应发送fallback",
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const messageCalls = vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('/message'));
+    expect(messageCalls).toHaveLength(1);
+    expect(String(messageCalls[0]?.[1]?.body ?? '')).toContain('目前判断更像是节点链路异常');
+    expect(getAllPendingReplies()).toHaveLength(0);
+  });
+
+  it("routes clear internal reasoning suppression to human review without a customer-visible fallback", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "分析：用户还在反馈不可用。\n回复策略：先检查节点和链路，不要直接下结论。" });
+    });
+
+    const req = createRequest(createPayload("session-internal-reasoning", "还是不行呢"));
+    const res = createResponse();
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyTimeoutMs: 2000,
+      autoReplyNoValidDeliverMessage: "",
+    };
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    const messageCalls = vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('/message'));
+    expect(messageCalls).toHaveLength(0);
+    expect(getAllPendingReplies()).toHaveLength(1);
+    expect(enqueueSystemEvent).toHaveBeenCalled();
+  });
+
+  it("suppresses non-keyword customer follow-ups during human pause without Telegram or AI", async () => {
+    markHumanPauseSession({
+      accountId: "site1",
+      websiteId: "123e4567-e89b-12d3-a456-426614174000",
+      sessionId: "session-human-pause",
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const req = createRequest(createPayload("session-human-pause", "还是不行呢"));
+    const res = createResponse();
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    expect(dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    expect(resolveAgentRoute).not.toHaveBeenCalled();
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(getAllPendingReplies()).toHaveLength(0);
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("non-keyword follow-up suppressed during human pause")
+    );
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain("forwarding customer follow-up");
+  });
+
+  it("forwards human-handoff keyword messages during human pause without AI", async () => {
+    markHumanPauseSession({
+      accountId: "site1",
+      websiteId: "123e4567-e89b-12d3-a456-426614174000",
+      sessionId: "session-human-pause",
+    });
+
+    const req = createRequest(createPayload("session-human-pause", "帮我转人工"));
+    const res = createResponse();
+
+    const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    expect(dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(getAllPendingReplies()).toHaveLength(1);
   });
 
   it("does not send fallback if primary send already succeeded", async () => {
@@ -363,6 +571,7 @@ describe("handleCrispWebhookRequest", () => {
     };
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
@@ -371,11 +580,59 @@ describe("handleCrispWebhookRequest", () => {
     expect(String(messageCalls[0]?.[1]?.body ?? '')).toContain('主回复已发出');
   });
 
+  it("routes queue-timeout messages to human review instead of sending customer fallback spam", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockReset();
+    let releaseFirstDispatch!: () => void;
+    const firstDispatchStarted = new Promise<void>((resolve) => {
+      dispatchReplyWithBufferedBlockDispatcher.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseFirstDispatch = release;
+        });
+      });
+    });
+
+    const config = {
+      ...createConfig(),
+      autoReply: true,
+      approvalMode: false,
+      autoReplyMaxConcurrent: 1,
+      autoReplySlotWaitTimeoutMs: 25,
+      autoReplyTimeoutMs: 60000,
+      autoReplyFailureMessage: "抱歉，当前客服系统响应较慢，已通知人工客服，请稍等一下。",
+    };
+
+    const firstReq = createRequest(createPayload("session-busy-1", "第一条"));
+    const firstRes = createResponse();
+    const firstHandled = handleCrispWebhookRequest(firstReq as never, firstRes as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+    await firstDispatchStarted;
+
+    const secondReq = createRequest(createPayload("session-busy-2", "第二条"));
+    const secondRes = createResponse();
+    const secondHandled = await handleCrispWebhookRequest(secondReq as never, secondRes as never, config, {}, "site1");
+    await flushCrispInboundDebounceForTests();
+
+    expect(secondHandled).toBe(true);
+    expect(secondRes.statusCode).toBe(200);
+    const fallbackCall = vi.mocked(fetch).mock.calls.find(([input, init]) =>
+      String(input).includes('/message') && String(init?.body ?? '').includes('当前客服系统响应较慢')
+    );
+    expect(fallbackCall).toBeUndefined();
+    expect(getAllPendingReplies()).toHaveLength(1);
+    expect(enqueueSystemEvent).toHaveBeenCalled();
+    expect(dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+
+    releaseFirstDispatch();
+    await firstHandled;
+  });
+
   it("enables managed mode via #托管 and sends command feedback", async () => {
     const req = createRequest(createPayload("session-command", "#托管"));
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
@@ -407,6 +664,7 @@ describe("handleCrispWebhookRequest", () => {
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
@@ -431,6 +689,7 @@ describe("handleCrispWebhookRequest", () => {
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
@@ -457,6 +716,7 @@ describe("handleCrispWebhookRequest", () => {
     const res = createResponse();
 
     const handled = await handleCrispWebhookRequest(req as never, res as never, createConfig(), {}, "site1");
+    await flushCrispInboundDebounceForTests();
 
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);

@@ -25,7 +25,16 @@ function isRetryableCrispError(err: unknown): boolean {
 }
 
 function normalizeCrispSessionId(sessionId: string): string {
-  return sessionId.startsWith('crisp:') ? sessionId.slice('crisp:'.length) : sessionId;
+  const trimmed = sessionId.trim();
+  if (!trimmed.toLowerCase().startsWith("crisp:")) {
+    return trimmed;
+  }
+  const remainder = trimmed.slice("crisp:".length);
+  const parts = remainder.split(":");
+  if (parts.length >= 3) {
+    return parts.slice(2).join(":").trim();
+  }
+  return remainder.trim();
 }
 
 export interface CrispApiClient {

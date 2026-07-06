@@ -25,6 +25,10 @@ declare module "clawdbot/plugin-sdk" {
             deliver: (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string; replyToId?: string }) => void | Promise<void>;
             onError?: (err: unknown, info?: { kind: string }) => void;
           };
+          replyOptions?: {
+            hasRepliedRef?: { value: boolean };
+            timeoutOverrideSeconds?: number;
+          };
         }): Promise<void>;
         formatAgentEnvelope(params: {
           channel: string;

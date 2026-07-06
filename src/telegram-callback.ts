@@ -491,6 +491,7 @@ async function handleTelegramCallbackUpdate(params: {
         ignoreActive: true,
         managedActive: false,
       });
+      removePendingReply(pending.id);
     }
     const feedback = pending
       ? `已忽略 [${pending.id}]`

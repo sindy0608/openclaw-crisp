@@ -2,10 +2,22 @@
   "id": "openclaw-crisp",
   "name": "Crisp",
   "description": "Crisp website chat channel for OpenClaw",
-  "channels": ["crisp"],
+  "channels": [
+    "crisp"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": true,
     "properties": {}
+  },
+  "channelConfigs": {
+    "crisp": {
+      "label": "Crisp",
+      "description": "Crisp website chat channel.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
   }
 }

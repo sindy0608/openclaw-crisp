@@ -16,6 +16,7 @@ import {
   type CrispMessage,
   type CrispSessionState,
   type CrispWebhookPayload,
+  truncateText,
 } from "./types.js";
 import { createCrispClient } from "./api-client.js";
 import {
@@ -34,6 +35,7 @@ import { buildSupportKnowledge } from "./kb.js";
 import { getCrispRuntime, hasCrispRuntime } from "./runtime.js";
 import { storePendingReply, updatePendingReplyTelegram } from "./pending-replies.js";
 import { sendTelegramNotification } from "./telegram-notify.js";
+import { isIgnoredSession, releaseIgnoredSession } from "./ignored-sessions.js";
 
 // In-memory session tracking for notification deduplication
 const activeSessions = new Map<string, CrispSessionState>();
@@ -41,8 +43,13 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // Prevent same Crisp session from running multiple auto-replies concurrently.
 const sessionProcessingLocks = new Map<string, Promise<void>>();
+const activeAutoRepliesByAccount = new Map<string, number>();
+type PendingAutoReplySlot = { resolve: (release: () => void) => void };
+const pendingAutoReplySlotsByAccount = new Map<string, PendingAutoReplySlot[]>();
 const sweepProcessedMessages = new Map<string, { messageKey: string; processedAt: number; source: "webhook" | "sweeper" }>();
+const recentOperatorReplies = new Map<string, { at: number; fingerprint?: number; content: string }>();
 const SWEEP_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+const RECENT_OPERATOR_REPLY_TTL_MS = 10 * 60 * 1000;
 const MAX_INBOUND_IMAGE_BYTES = 8 * 1024 * 1024;
 const INBOUND_IMAGE_FETCH_TIMEOUT_MS = 10_000;
 const INBOUND_IMAGE_LOCAL_RETENTION_MS = 15 * 60 * 1000;
@@ -72,6 +79,101 @@ interface PreparedInboundMedia {
   contentType?: string;
   sizeBytes?: number;
 }
+
+function resolveAutoReplyMaxConcurrent(maxConcurrent: number | undefined): number {
+  if (typeof maxConcurrent !== "number" || !Number.isFinite(maxConcurrent)) {
+    return 2;
+  }
+  return Math.max(1, Math.floor(maxConcurrent));
+}
+
+function buildAutoReplySlotRelease(accountId: string): () => void {
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+
+    const queue = pendingAutoReplySlotsByAccount.get(accountId);
+    const next = queue?.shift();
+    if (queue && queue.length === 0) {
+      pendingAutoReplySlotsByAccount.delete(accountId);
+    }
+    if (next) {
+      // Keep the active count reserved for the next queued handler. This avoids
+      // a release/acquire race where a new webhook could jump ahead of FIFO queue.
+      next.resolve(buildAutoReplySlotRelease(accountId));
+      return;
+    }
+
+    const current = activeAutoRepliesByAccount.get(accountId) ?? 0;
+    if (current <= 1) {
+      activeAutoRepliesByAccount.delete(accountId);
+    } else {
+      activeAutoRepliesByAccount.set(accountId, current - 1);
+    }
+  };
+}
+
+async function acquireAutoReplySlot(
+  accountId: string,
+  maxConcurrent: number | undefined,
+  waitTimeoutMs: number | undefined
+): Promise<(() => void) | null> {
+  const safeLimit = resolveAutoReplyMaxConcurrent(maxConcurrent);
+  const active = activeAutoRepliesByAccount.get(accountId) ?? 0;
+  if (active < safeLimit) {
+    activeAutoRepliesByAccount.set(accountId, active + 1);
+    return buildAutoReplySlotRelease(accountId);
+  }
+
+  const safeWaitTimeoutMs = typeof waitTimeoutMs === "number" && Number.isFinite(waitTimeoutMs)
+    ? Math.max(0, Math.floor(waitTimeoutMs))
+    : 5000;
+  if (safeWaitTimeoutMs === 0) {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const queue = pendingAutoReplySlotsByAccount.get(accountId) ?? [];
+    let settled = false;
+    const entry: PendingAutoReplySlot = {
+      resolve: (release) => {
+        if (settled) {
+          release();
+          return;
+        }
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve(release);
+      },
+    };
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const currentQueue = pendingAutoReplySlotsByAccount.get(accountId);
+      if (currentQueue) {
+        const index = currentQueue.indexOf(entry);
+        if (index >= 0) {
+          currentQueue.splice(index, 1);
+        }
+        if (currentQueue.length === 0) {
+          pendingAutoReplySlotsByAccount.delete(accountId);
+        }
+      }
+      resolve(null);
+    }, safeWaitTimeoutMs);
+    timeoutHandle.unref?.();
+    queue.push(entry);
+    pendingAutoReplySlotsByAccount.set(accountId, queue);
+  });
+}
+
+function getAutoReplyQueueDepth(accountId: string): number {
+  return pendingAutoReplySlotsByAccount.get(accountId)?.length ?? 0;
+}
+
 
 // Re-export for backward compatibility
 export { setCrispRuntime, getCrispRuntime } from "./runtime.js";
@@ -139,7 +241,8 @@ function trackSession(
   visitorName: string,
   visitorEmail?: string
 ): CrispSessionState {
-  const existing = activeSessions.get(sessionId);
+  const trackedKey = buildTrackedSessionKey(accountId, websiteId, sessionId);
+  const existing = activeSessions.get(trackedKey);
   const now = Date.now();
 
   if (existing) {
@@ -161,7 +264,7 @@ function trackSession(
     isNew: true,
   };
 
-  activeSessions.set(sessionId, session);
+  activeSessions.set(trackedKey, session);
 
   // Cleanup old sessions periodically
   if (activeSessions.size > 100) {
@@ -182,6 +285,83 @@ function buildTrackedSessionKey(
   sessionId: string
 ): string {
   return `${accountId}:${websiteId}:${sessionId}`;
+}
+
+function buildCrispToolTarget(params: {
+  accountId: string;
+  websiteId: string;
+  sessionId: string;
+}): string {
+  return `crisp:${params.accountId}:${params.websiteId}:${params.sessionId}`;
+}
+
+function buildLightweightAgentSessionKey(baseSessionKey: string, config: CrispConfig, timestampMs: number): string {
+  const windowMs = config.autoReplySessionWindowMs;
+  if (!windowMs || windowMs <= 0) return baseSessionKey;
+  const safeTimestampMs = Number.isFinite(timestampMs) && timestampMs > 0 ? timestampMs : Date.now();
+  const windowId = Math.floor(safeTimestampMs / windowMs);
+  return `${baseSessionKey}:w${windowId}`;
+}
+
+function formatHistoryMessageContent(content: string, maxChars: number): string {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  return truncateText(normalized, maxChars);
+}
+
+function buildLightweightPromptBody(params: {
+  normalizedMessageText: string;
+  mediaContext: string;
+  historyText: string;
+  supportContext: string;
+  outputGuard: string;
+  maxChars: number;
+}): string {
+  const latestMessage = `\n\n[Latest customer message - answer this only]\n${params.normalizedMessageText}${params.mediaContext}\n[End of latest customer message]`;
+  const latestMessageGuard = `[最新消息优先级硬性要求]\n只回答上方 [Latest customer message - answer this only] 中的最新客户消息。历史消息仅用于理解背景，不得回答历史里的旧问题；如果历史与最新消息冲突，以最新消息为准。\n[End of 最新消息优先级硬性要求]`;
+  const suffix = `\n\n${params.supportContext}\n\n${latestMessage}\n\n${latestMessageGuard}\n\n${params.outputGuard}`;
+  const prefixBudget = Math.max(1000, params.maxChars - suffix.length);
+  const prefix = truncateText(params.historyText, prefixBudget);
+  return `${prefix}${suffix}`;
+}
+
+function normalizeCrispTimestampMs(timestamp?: number): number {
+  if (!timestamp || !Number.isFinite(timestamp)) return Date.now();
+  // Crisp REST often uses seconds, while webhooks can send milliseconds.
+  // Never multiply an already-ms timestamp, otherwise reply dedupe/handoff logic
+  // can think an old operator reply happened in the future and suppress AI replies.
+  return timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000;
+}
+
+function recordRecentOperatorReply(params: {
+  accountId: string;
+  websiteId: string;
+  sessionId: string;
+  content: string;
+  fingerprint?: number;
+  timestampMs?: number;
+}): void {
+  const content = params.content.trim();
+  if (!content) return;
+  const key = buildTrackedSessionKey(params.accountId, params.websiteId, params.sessionId);
+  const now = Date.now();
+  const at = params.timestampMs && Number.isFinite(params.timestampMs) ? params.timestampMs : now;
+  recentOperatorReplies.set(key, { at, fingerprint: params.fingerprint, content });
+  const cutoff = now - RECENT_OPERATOR_REPLY_TTL_MS;
+  const futureCutoff = now + 60_000;
+  for (const [existingKey, value] of recentOperatorReplies) {
+    if (value.at < cutoff || value.at > futureCutoff) {
+      recentOperatorReplies.delete(existingKey);
+    }
+  }
+}
+
+function getRecentOperatorReplySince(sessionKey: string, sinceMs: number): { at: number; fingerprint?: number; content: string } | null {
+  const reply = recentOperatorReplies.get(sessionKey);
+  if (!reply) return null;
+  const now = Date.now();
+  if (reply.at > now + 60_000) return null;
+  if (reply.at < sinceMs) return null;
+  return reply;
 }
 
 function buildInboundMessageKey(message: {
@@ -272,54 +452,161 @@ function isHumanOperatorWebhook(data: CrispWebhookPayload["data"] | undefined): 
   return Boolean(nickname || userId);
 }
 
-const INTERNAL_REASONING_FALLBACK = "";
+const SAFE_VISIBLE_FALLBACK_MESSAGE = "";
+const INTERNAL_REASONING_FALLBACK = SAFE_VISIBLE_FALLBACK_MESSAGE;
+const INTERNAL_FAILURE_REPLY_PATTERNS = [
+  /^⚠️\s*✉️\s*Message(?:\s*:\s*[^\n]+)?\s+failed\s*$/i,
+  /^⚠️\s*Something went wrong while processing your request\.\s*Please try again,?\s*or use \/new to start a fresh session\.\s*$/i,
+  /^Something went wrong while processing your request\.\s*Please try again,?\s*or use \/new to start a fresh session\.\s*$/i,
+  /^\[assistant turn failed before producing content\]\s*$/i,
+];
+
+function resolveSafeFallbackMessage(configured: string | undefined): string {
+  return configured?.trim() ?? "";
+}
+
+function isInternalFailureReply(text: string): boolean {
+  const normalized = text.trim();
+  return INTERNAL_FAILURE_REPLY_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isVisibleCustomerReplyStart(text: string): boolean {
+  return /^(您好|你好|亲爱的|尊敬的|抱歉|不好意思|非常理解|理解您|可以的|建议您|请您|目前|您可以|这边|好的|收到|感谢|谢谢|Hello|Hi|Sorry|Thanks|Thank you|Please|You can)/i.test(text.trim());
+}
+
+function isVisibleCustomerReplyHeading(text: string): boolean {
+  return /^(?:#{1,4}\s*)?(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|正式回复|建议回复|Final answer|Customer-facing reply|Reply to customer|Answer)[:：]?\s*$/i.test(text.trim());
+}
+
+function isInternalReasoningHeading(text: string): boolean {
+  return /^(?:#{1,4}\s*)?(?:\*\*)?\s*(?:Thinking|思考|Reasoning|推理|内部思考|内部推理|思路|处理思路|回复策略|决策记录|内部判断|Decision|Internal reasoning|Model reasoning)\s*(?:\*\*)?\s*[:：]?\s*$/i.test(text.trim());
+}
+
+function startsWithInternalReasoningHeading(text: string): boolean {
+  return /^(?:#{1,4}\s*)?(?:\*\*)?\s*(?:Thinking|思考|Reasoning|推理|内部思考|内部推理|思路|处理思路|回复策略|决策记录|内部判断|Decision|Internal reasoning|Model reasoning)\s*(?:\*\*)?\s*[:：]?(?:\r?\n|$)/i.test(text.trim());
+}
+
+function isInternalDecisionRecord(text: string): boolean {
+  return /^\s*(?:[-*]\s*)?(?:用户说|用户询问|用户想要|客户说|客户询问|这说明|根据知识库|知识库显示|我应该|我需要|我会|应该|需要确认|需要判断|看起来|这种情况|内部判断|内部决策|决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|We need|Need to|Final answer|Customer-facing reply)[:：]/i.test(text.trim());
+}
+
+function isLikelyInternalMonologueParagraph(text: string): boolean {
+  const normalized = text.replace(/\s+/g, "");
+  if (normalized.length < 18) {
+    return false;
+  }
+  if (isVisibleCustomerReplyStart(text) || /[您你](可以|需要|请|好|先|再|提供|确认|查看)|感谢|谢谢|抱歉|不好意思|很高兴|为您|帮您|协助您/.test(text)) {
+    return false;
+  }
+
+  const analysisTerms = [
+    "我",
+    "用户",
+    "客户",
+    "应该",
+    "需要",
+    "看起来",
+    "可能",
+    "确认",
+    "判断",
+    "分析",
+    "推理",
+    "思考",
+    "猜测",
+    "意图",
+    "上下文",
+    "知识库",
+    "工具",
+    "规则",
+    "不能",
+    "不要",
+    "如果",
+    "先",
+    "然后",
+    "所以",
+    "因此",
+    "内部",
+    "转人工",
+  ];
+  const hits = analysisTerms.reduce((count, term) => count + (normalized.includes(term) ? 1 : 0), 0);
+  return hits >= 4 && /我|用户|客户/.test(normalized) && /应该|需要|看起来|确认|判断|分析|推理|思考|可能/.test(normalized);
+}
+
+function removeInternalReasoningBlocks(text: string, traceId: string): string {
+  const paragraphs = text.split(/\n{2,}/);
+  const kept: string[] = [];
+  let dropping = false;
+  let droppedCount = 0;
+
+  for (const paragraph of paragraphs) {
+    const trimmedParagraph = paragraph.trim();
+    if (!trimmedParagraph) {
+      continue;
+    }
+
+    if (isVisibleCustomerReplyHeading(trimmedParagraph)) {
+      dropping = false;
+      continue;
+    }
+
+    if (isInternalReasoningHeading(trimmedParagraph) || startsWithInternalReasoningHeading(trimmedParagraph) || isInternalDecisionRecord(trimmedParagraph) || isLikelyInternalMonologueParagraph(trimmedParagraph)) {
+      dropping = true;
+      droppedCount += 1;
+      continue;
+    }
+
+    if (dropping) {
+      if (isVisibleCustomerReplyStart(trimmedParagraph)) {
+        dropping = false;
+      } else {
+        droppedCount += 1;
+        continue;
+      }
+    }
+
+    kept.push(trimmedParagraph);
+  }
+
+  if (droppedCount > 0) {
+    const sanitized = kept.join("\n\n").trim();
+    console.warn(`[crisp] ⚠️ Trace ${traceId} removed internal reasoning block(s) from reply (droppedParagraphs=${droppedCount}, originalChars=${text.length}, sanitizedChars=${sanitized.length})`);
+    return sanitized;
+  }
+
+  return text.trim();
+}
+
+function isUsableCustomerReply(text: string): boolean {
+  const normalized = text.replace(/\s+/g, "").trim();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.length <= 2) {
+    return false;
+  }
+  if (/^(好的|好|嗯|啊|哦|收到|明白|可以|谢谢|感谢|OK|Ok|ok|Thanks|Thankyou|Sure|Hi|Hello)[。.!！~～]*$/i.test(normalized)) {
+    return false;
+  }
+  if (/^(您好|你好|亲|亲爱的|尊敬的客户|感谢您的咨询|请稍等|我们会尽快回复|已收到您的消息)[。.!！~～]*$/i.test(normalized)) {
+    return false;
+  }
+  if (isInternalReasoningHeading(text) || isInternalDecisionRecord(text) || isLikelyInternalMonologueParagraph(text)) {
+    return false;
+  }
+  return true;
+}
 
 function sanitizeCustomerReply(text: string, traceId: string): string {
   const trimmed = text.trim();
   if (!trimmed) {
     return trimmed;
   }
-
-  const internalMarkers = [
-    "用户说",
-    "用户询问",
-    "这说明",
-    "根据知识库",
-    "我应该",
-    "等等，",
-    "等等",
-    "这种情况",
-    "内部判断",
-    "转人工规则",
-    "分析",
-    "推理",
-    "思考",
-    "判断",
-    "处理思路",
-    "回复策略",
-    "客户可见回复",
-    "最终回复",
-    "回复客户",
-    "Reasoning:",
-    "Reasoning",
-    "The user",
-    "the user",
-    "I need",
-    "I should",
-    "I will",
-    "knowledge base",
-    "final answer",
-    "customer-facing",
-  ];
-  const markerHits = internalMarkers.filter((marker) => trimmed.includes(marker)).length;
-  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will|Final answer|Customer-facing reply)[:：]/i;
-  const internalLineHits = trimmed.split(/\r?\n/).filter((line) => internalLinePattern.test(line)).length;
-  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will)[:：]?/i.test(trimmed);
-  const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部|the user|knowledge base|I should|I need)/i.test(trimmed);
-
-  if (!startsWithInternalMarker && markerHits < 2 && internalLineHits === 0 && !numberedInternalPlan) {
-    return trimmed;
+  if (isInternalFailureReply(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal failure reply payload`);
+    return SAFE_VISIBLE_FALLBACK_MESSAGE;
   }
+
+  const internalLinePattern = /^\s*(?:[-*]\s*)?(?:用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will|Final answer|Customer-facing reply)[:：]/i;
 
   const labeledReply = trimmed.match(/(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|Final answer|Customer-facing reply|Reply to customer)[:：]\s*([\s\S]+)$/i);
   const labeledCandidate = labeledReply?.[1]?.trim();
@@ -328,37 +615,73 @@ function sanitizeCustomerReply(text: string, traceId: string): string {
     return labeledCandidate;
   }
 
-  const customerFacingStarts = [
-    "您好",
-    "你好",
-    "抱歉",
-    "非常理解",
-    "理解您",
-    "可以的",
-    "建议您",
-    "请您",
-    "目前",
-    "Hello",
-    "Hi",
-    "Sorry",
-    "Thanks",
-    "Thank you",
-    "Please",
-    "You can",
-  ];
-  for (const marker of customerFacingStarts) {
-    const index = trimmed.lastIndexOf(marker);
-    if (index > 0) {
-      const candidate = trimmed.slice(index).trim();
-      if (candidate.length >= 12 && !/^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|The user|I need|I should|I will)/i.test(candidate)) {
-        console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting customer-facing suffix (originalChars=${trimmed.length}, sanitizedChars=${candidate.length})`);
-        return candidate;
-      }
+  const withoutReasoningBlocks = removeInternalReasoningBlocks(trimmed, traceId);
+  if (!withoutReasoningBlocks) {
+    return INTERNAL_REASONING_FALLBACK;
+  }
+  if (withoutReasoningBlocks !== trimmed) {
+    if (isUsableCustomerReply(withoutReasoningBlocks)) {
+      return withoutReasoningBlocks;
     }
+    return INTERNAL_REASONING_FALLBACK;
   }
 
-  console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal reasoning reply (originalChars=${trimmed.length}, markerHits=${markerHits})`);
-  return INTERNAL_REASONING_FALLBACK;
+  const customerFacingSuffix = trimmed.match(/(?:^|\n{2,})(您好|你好|抱歉|不好意思|非常理解|理解您|可以的|建议您|请您|目前|您可以|这边|好的|收到|感谢|谢谢|Hello|Hi|Sorry|Thanks|Thank you|Please|You can)[\s\S]*$/i)?.[0]?.trim();
+  if (customerFacingSuffix && customerFacingSuffix !== trimmed && customerFacingSuffix.length >= 12 && !internalLinePattern.test(customerFacingSuffix)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} sanitized internal reasoning reply by extracting customer-facing suffix (originalChars=${trimmed.length}, sanitizedChars=${customerFacingSuffix.length})`);
+    return customerFacingSuffix;
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const internalLineHits = lines.filter((line) => internalLinePattern.test(line)).length;
+  const startsWithInternalMarker = /^(用户说|用户询问|这说明|根据知识库|我应该|等等|这种情况|内部判断|内部决策|转人工规则|分析|推理|思考|判断|处理思路|回复策略|Reasoning|Thinking|Decision|The user|The customer|I need|I should|I will)[:：]/i.test(trimmed);
+  const numberedInternalPlan = /(?:^|\n)\s*(?:\d+\.|[-*])\s*(?:用户|知识库|应该|需要判断|转人工|内部|the user|knowledge base|I should|I need)/i.test(trimmed);
+  const explicitReasoningBlock = /(?:^|\n)\s*(?:分析|推理|思考|处理思路|回复策略|Reasoning)[:：]\s*\S[\s\S]*(?:最终回复|客户可见回复|回复客户|发送给客户|对客户说|Final answer|Customer-facing reply)[:：]/i.test(trimmed);
+
+  // Be conservative: normal customer-support answers often contain words like
+  // “判断/分析/目前”. Do not drop them unless the whole payload clearly looks like
+  // an internal plan/reasoning transcript. False positives here create customer-
+  // visible fallback spam, which is worse than sending a slightly imperfect answer.
+  if (explicitReasoningBlock || internalLineHits >= 2 || (startsWithInternalMarker && numberedInternalPlan)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal reasoning reply (originalChars=${trimmed.length}, internalLineHits=${internalLineHits})`);
+    return INTERNAL_REASONING_FALLBACK;
+  }
+
+  // Hard guard: Chinese model paraphrasing/reasoning that starts with "用户反馈" or "用户问：" or "客户问：" or contains "这通常是"
+  if (/^\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问)[\s\S]{0,300}/i.test(trimmed) ||
+      /^\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\s\S]{0,300}/i.test(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed Chinese model paraphrase/reasoning (用户反馈/用户问/这通常是)`);
+    return INTERNAL_REASONING_FALLBACK;
+  }
+
+  if (!isUsableCustomerReply(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed unusable customer reply payload (originalChars=${trimmed.length})`);
+    return SAFE_VISIBLE_FALLBACK_MESSAGE;
+  }
+
+  // Aggressive heuristic for Kimi-style monologue summaries that repeat the user question and then cite knowledge-base rules.
+  if (/(?:用户询问的是|用户问的是|用户询问|用户问)[：:]?\s*[\s\S]+?根据知识库[\s\S]{0,200}?所以答案是/i.test(trimmed) ||
+      /(?:用户询问的是|用户问的是|用户询问|用户问)[：:]?\s*[\s\S]+?根据知识库[\s\S]{0,500}?\n(?:[\s\S]*?\n)?(?:所以|因此|综上|结论[:：]|Answer[:：]|Final answer[:：])/i.test(trimmed) ||
+      /^\s*根据知识库中的规则[:：]/i.test(trimmed) ||
+      /(?:这是一个标准问题|直接回答即可|无需特殊处理|按规则处理)/i.test(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed Kimi-style internal summary (repeats user question + knowledge-base rules)`);
+    return INTERNAL_REASONING_FALLBACK;
+  }
+
+  // Heuristic for English model reasoning that paraphrases the user's message and then describes what kind of response is appropriate.
+  if (/(?:The user's latest message is|The user is saying|This is a brief acknowledgment from the user|There's no new question or issue to address|A brief,? [\w\s]+ response is appropriate|is appropriate here|I should respond with|I will respond with|I should keep)/i.test(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed English model reasoning/paraphrase`);
+    return INTERNAL_REASONING_FALLBACK;
+  }
+
+  // Suppress any remaining OpenClaw internal meta / fallback status messages.
+  const internalMetaPattern = /^(?:Model Fallback|Fallback|selected\s+[\w\/._-]+\s*[:;]|\(?[\w\s\/]+timeout\)?)/i;
+  if (internalMetaPattern.test(trimmed)) {
+    console.warn(`[crisp] ⚠️ Trace ${traceId} suppressed internal meta/fallback status message`);
+    return SAFE_VISIBLE_FALLBACK_MESSAGE;
+  }
+
+  return trimmed;
 }
 
 /**
@@ -742,6 +1065,13 @@ async function flushCrispInboundBuffer(key: string): Promise<void> {
   }
 }
 
+export async function flushCrispInboundDebounceForTests(): Promise<void> {
+  const keys = [...crispInboundBuffers.keys()];
+  for (const key of keys) {
+    await flushCrispInboundBuffer(key);
+  }
+}
+
 async function enqueueCrispInbound(params: {
   config: CrispConfig;
   clawdbotConfig: ClawdbotConfig;
@@ -749,7 +1079,7 @@ async function enqueueCrispInbound(params: {
   trigger: "webhook" | "sweeper";
   inbound: BufferedInboundMessage;
 }): Promise<void> {
-  const shouldDebounce = params.trigger === "webhook" && params.inbound.type === "text" && Boolean(params.inbound.content.trim());
+  const shouldDebounce = process.env.VITEST !== "true" && params.trigger === "webhook" && params.inbound.type === "text" && Boolean(params.inbound.content.trim());
   const key = buildCrispDebounceKey({ accountId: params.accountId, inbound: params.inbound });
 
   if (!shouldDebounce) {
@@ -866,16 +1196,16 @@ async function processInboundMessage(params: {
       content: string;
       markProcessed?: boolean;
       logPrefix: string;
-    }): Promise<void> => {
+    }): Promise<boolean> => {
       const rawText = params.content.trim();
       const text = rawText ? sanitizeCustomerReply(rawText, traceId).trim() : rawText;
       if (!text) {
         console.warn(`[crisp] ⚠️ ${params.logPrefix} skipped empty text payload`);
-        return;
+        return false;
       }
-      if (/^⚠️\s*✉️\s*Message failed\s*$/i.test(text)) {
-        console.warn(`[crisp] ⚠️ ${params.logPrefix} suppressed tool failure text payload`);
-        return;
+      if (isInternalFailureReply(text) || !isUsableCustomerReply(text)) {
+        console.warn(`[crisp] ⚠️ ${params.logPrefix} suppressed unusable text payload`);
+        return false;
       }
       console.log(`[crisp] 🔎 ${params.logPrefix} sending message to Crisp (chars=${text.length})`);
       try {
@@ -888,6 +1218,7 @@ async function processInboundMessage(params: {
           markCurrentMessageProcessed();
         }
         console.log(`[crisp] ✅ ${params.logPrefix} sent to ${sessionId} (fingerprint=${sendResult.fingerprint}, type=${sendResult.type ?? "-"}, from=${sendResult.from ?? "-"}, origin=${sendResult.origin ?? "-"}, echoedContent=${JSON.stringify(sendResult.content ?? "")})`);
+        return true;
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         const sessionMissing = /session_not_found|404\s+Not Found/i.test(detail);
@@ -928,6 +1259,25 @@ async function processInboundMessage(params: {
     const isSessionManaged = isManagedSession(managedSessionKey);
     const needsHumanHandoff = isHumanHandoffMessage(normalizedMessageText);
     const isHumanPaused = isHumanPauseSession(managedSessionKey);
+
+    if (isIgnoredSession(managedSessionKey)) {
+      console.log(`[crisp] 🔕 Ignored session ${sessionId}: suppressing approval forwarding and AI reply`);
+      markCurrentMessageProcessed();
+      return;
+    }
+
+    if (isHumanPaused) {
+      const remainingMs = getHumanPauseRemainingMs(managedSessionKey);
+      console.log(
+        `[crisp] ⏸️ Human pause active for ${sessionId}, remaining=${Math.ceil(remainingMs / 1000)}s, skipping AI reply`
+      );
+      if (!needsHumanHandoff) {
+        console.log(`[crisp] ⏸️ Human pause: non-keyword follow-up suppressed during human pause without AI reply or Telegram notification`);
+        markCurrentMessageProcessed();
+        return;
+      }
+    }
+
     const preparedMedia = await prepareInboundImageMedia({
       core,
       mediaUrl,
@@ -935,13 +1285,6 @@ async function processInboundMessage(params: {
     });
     const agentMediaPath = preparedMedia?.localPath;
     const agentMediaContentType = preparedMedia?.contentType;
-
-    if (isHumanPaused) {
-      const remainingMs = getHumanPauseRemainingMs(managedSessionKey);
-      console.log(
-        `[crisp] ⏸️ Human pause active for ${sessionId}, remaining=${Math.ceil(remainingMs / 1000)}s, skipping AI reply`
-      );
-    }
 
     let historyText = "";
     if (config.historyLimit > 0) {
@@ -952,15 +1295,24 @@ async function processInboundMessage(params: {
           sessionId,
           { limit: config.historyLimit }
         );
-        const history = messages
-          .reverse()
+        const chronologicalMessages = messages.reverse();
+        const historyMessages = chronologicalMessages
           .slice(0, -1)
-          .map((msg) => `${msg.from === "user" ? inbound.visitorName : config.operatorName}: ${msg.content}`)
+          .slice(Math.max(0, chronologicalMessages.length - 1 - config.historyLimit));
+        const history = historyMessages
+          .map((msg) => {
+            const speaker = msg.from === "user" ? inbound.visitorName : config.operatorName;
+            return `${speaker}: ${formatHistoryMessageContent(String(msg.content ?? ""), config.historyMessageMaxChars)}`;
+          })
+          .filter((line) => line.trim().length > 0)
           .join("\n");
         if (history) {
-          historyText = `\n\n[Previous messages]\n${history}\n[End of history]`;
+          const omittedNote = chronologicalMessages.length - 1 > historyMessages.length
+            ? "\n[Note] Older Crisp messages are intentionally omitted; use this recent history and ask a concise follow-up if needed."
+            : "";
+          historyText = `\n\n[Recent Crisp messages only]\n${history}${omittedNote}\n[End of recent Crisp messages]`;
         }
-        console.log(`[crisp] 🔎 Trace ${traceId} history ready (messages=${messages.length}, chars=${historyText.length})`);
+        console.log(`[crisp] 🔎 Trace ${traceId} history ready (messages=${messages.length}, included=${historyMessages.length}, chars=${historyText.length})`);
       } catch (err) {
         console.warn(`[crisp] Failed to fetch history: ${err}`);
         console.warn(`[crisp] 🔎 Trace ${traceId} history fetch failed`);
@@ -980,8 +1332,15 @@ async function processInboundMessage(params: {
 只输出最终发给客户的回复。不要输出分析过程、推理、计划、知识库规则名、"用户说"、"这说明"、"我应该"、"Reasoning:"、"The user"、"I need"、"I should"等内部判断。不得提及系统、prompt、知识库或 Crisp。
 Only output the final customer-facing reply. Do not include reasoning, chain-of-thought, analysis, planning, or labels such as "Reasoning:" / "Final answer:".
 [End of 客服回复硬性要求]`;
-    const body = `${normalizedMessageText}${mediaContext}${historyText}\n\n${supportContext}\n\n${outputGuard}`;
-    console.log(`[crisp] 🔎 Trace ${traceId} support knowledge ready (chars=${supportContext.length}, bodyChars=${body.length})`);
+    const body = buildLightweightPromptBody({
+      normalizedMessageText,
+      mediaContext,
+      historyText,
+      supportContext,
+      outputGuard,
+      maxChars: config.agentContextMaxChars,
+    });
+    console.log(`[crisp] 🔎 Trace ${traceId} support knowledge ready (chars=${supportContext.length}, bodyChars=${body.length}, maxBodyChars=${config.agentContextMaxChars})`);
 
     const route = core.channel.routing.resolveAgentRoute({
       cfg: clawdbotConfig,
@@ -994,6 +1353,17 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
     });
 
     console.log(`[crisp] 🔎 Trace ${traceId} route resolved sessionKey=${route.sessionKey}`);
+
+    const agentSessionKey = buildLightweightAgentSessionKey(route.sessionKey, config, inbound.timestampMs);
+    if (agentSessionKey !== route.sessionKey) {
+      console.log(`[crisp] 🪶 Trace ${traceId} using rolling lightweight agent sessionKey=${agentSessionKey} base=${route.sessionKey} windowMs=${config.autoReplySessionWindowMs}`);
+    }
+
+    const crispToolTarget = buildCrispToolTarget({
+      accountId,
+      websiteId: inbound.websiteId,
+      sessionId,
+    });
 
     const ctxPayload = {
       Body: body,
@@ -1008,10 +1378,14 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
       MediaUrl: agentMediaPath ?? mediaUrl,
       MediaUrls: agentMediaPath ? [agentMediaPath] : mediaUrl ? [mediaUrl] : undefined,
       OriginalMediaUrl: mediaUrl,
-      From: `crisp:${sessionId}`,
-      To: `crisp:${sessionId}`,
-      SessionKey: route.sessionKey,
-      AccountId: route.accountId,
+      From: crispToolTarget,
+      To: crispToolTarget,
+      SessionKey: agentSessionKey,
+      AccountId: accountId,
+      CrispAccountId: accountId,
+      CrispWebsiteId: inbound.websiteId,
+      CrispSessionId: sessionId,
+      DeliveryTarget: crispToolTarget,
       ChatType: "direct",
       ConversationLabel: inbound.visitorName,
       SenderName: inbound.visitorName,
@@ -1021,35 +1395,13 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
       MessageSid: inbound.fingerprint?.toString(),
       Timestamp: inbound.timestampMs,
       OriginatingChannel: "crisp",
-      OriginatingTo: `crisp:${sessionId}`,
+      OriginatingTo: crispToolTarget,
       WasMentioned: true,
       CommandAuthorized: true,
     };
 
     if (isHumanPaused) {
-      if (needsHumanHandoff) {
-        console.log(`[crisp] 🔄 Human pause: human-handoff keyword detected, storing for human review without AI reply...`);
-        await storePendingReplyAndNotify({
-          config,
-          core,
-          route,
-          accountId,
-          sessionId,
-          websiteId: inbound.websiteId,
-          visitorName: inbound.visitorName,
-          messageText: normalizedMessageText,
-          mediaUrl,
-        });
-      } else {
-        console.log(`[crisp] ⏸️ Human pause: no human-handoff keyword, suppressing Telegram notification and AI reply`);
-      }
-      markCurrentMessageProcessed();
-      return;
-    }
-
-    if (config.approvalMode && !isSessionManaged) {
-      console.log(`[crisp] 🔄 Approval mode: storing for human review...`);
-
+      console.log(`[crisp] 🔄 Human pause: human-handoff keyword detected, storing for human review without AI reply...`);
       await storePendingReplyAndNotify({
         config,
         core,
@@ -1063,6 +1415,27 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
       });
       markCurrentMessageProcessed();
       return;
+    }
+
+    if (config.approvalMode && !isSessionManaged) {
+      if (needsHumanHandoff) {
+        console.log(`[crisp] 🔄 Approval mode: human-handoff keyword detected, storing for human review...`);
+        await storePendingReplyAndNotify({
+          config,
+          core,
+          route,
+          accountId,
+          sessionId,
+          websiteId: inbound.websiteId,
+          visitorName: inbound.visitorName,
+          messageText: normalizedMessageText,
+          mediaUrl,
+        });
+        markCurrentMessageProcessed();
+        return;
+      }
+
+      console.log(`[crisp] 🔄 Approval mode with auto-reply: non-keyword message, continuing to AI auto-reply for ${sessionId}`);
     }
 
     if (isSessionManaged) {
@@ -1083,14 +1456,40 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
       console.log(`[crisp] 🫴 Managed session: suppressing approval forwarding and using auto-reply`);
     }
 
+    const autoReplyMaxConcurrent = resolveAutoReplyMaxConcurrent(config.autoReplyMaxConcurrent);
+    const queueDepthBeforeAcquire = getAutoReplyQueueDepth(accountId);
+    if ((activeAutoRepliesByAccount.get(accountId) ?? 0) >= autoReplyMaxConcurrent) {
+      console.warn(`[crisp] 🚦 Trace ${traceId} auto-reply concurrency limit reached for account=${accountId} limit=${autoReplyMaxConcurrent}; queued behind ${queueDepthBeforeAcquire} pending auto-replies waitTimeoutMs=${config.autoReplySlotWaitTimeoutMs}`);
+    }
+    const releaseAutoReplySlot = await acquireAutoReplySlot(accountId, autoReplyMaxConcurrent, config.autoReplySlotWaitTimeoutMs);
+    if (!releaseAutoReplySlot) {
+      console.warn(`[crisp] 🚦 Trace ${traceId} auto-reply slot wait timed out after ${config.autoReplySlotWaitTimeoutMs}ms; routing to human review instead of sending customer fallback`);
+      await storePendingReplyAndNotify({
+        config,
+        core,
+        route,
+        accountId,
+        sessionId,
+        websiteId: inbound.websiteId,
+        visitorName: inbound.visitorName,
+        messageText: normalizedMessageText,
+        mediaUrl,
+      });
+      markCurrentMessageProcessed();
+      console.log(`[crisp] 🔎 Trace ${traceId} end inbound handling elapsedMs=${Date.now() - handlerStartedAt} sentReply=false queueTimedOut=true humanReview=true`);
+      console.log(`[crisp] 🔓 Session lock release: ${processingKey}`);
+      return;
+    }
+
     let sentReply = false;
     let nonEmptyDeliverCount = 0;
     let emptyDeliverCount = 0;
     let dispatchErrored = false;
     let dispatchTimedOut = false;
+    const hasRepliedRef = { value: false };
 
     try {
-      console.log(`[crisp] 🔎 Trace ${traceId} dispatch start (timeoutMs=${config.autoReplyTimeoutMs})`);
+      console.log(`[crisp] 🔎 Trace ${traceId} dispatch start (timeoutMs=${config.autoReplyTimeoutMs}, accountActiveLimit=${autoReplyMaxConcurrent})`);
 
       const dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
@@ -1098,6 +1497,10 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
         dispatcherOptions: {
           deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string }) => {
             console.log(`[crisp] 🔎 Trace ${traceId} deliver invoked (hasText=${Boolean(payload.text?.trim())}, mediaUrls=${payload.mediaUrls?.length ?? 0}, mediaUrl=${payload.mediaUrl ? 1 : 0})`);
+            if (dispatchTimedOut && sentReply) {
+              console.warn(`[crisp] ⚠️ Trace ${traceId} skipping late deliver after timeout fallback`);
+              return;
+            }
             const rawText = payload.text?.trim();
             const text = rawText ? sanitizeCustomerReply(rawText, traceId) : rawText;
             if (!text) {
@@ -1105,17 +1508,37 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
               console.warn(`[crisp] ⚠️ Trace ${traceId} empty deliver payload (#${emptyDeliverCount})`);
               return;
             }
-            if (/^⚠️\s*✉️\s*Message failed\s*$/i.test(text)) {
+            if (isInternalFailureReply(text)) {
               emptyDeliverCount += 1;
-              console.warn(`[crisp] ⚠️ Trace ${traceId} suppressing tool failure deliver payload (#${emptyDeliverCount})`);
+              console.warn(`[crisp] ⚠️ Trace ${traceId} suppressing internal failure deliver payload (#${emptyDeliverCount})`);
+              if (!sentReply) {
+                dispatchErrored = true;
+              }
+              return;
+            }
+            if (!isUsableCustomerReply(text)) {
+              emptyDeliverCount += 1;
+              console.warn(`[crisp] ⚠️ Trace ${traceId} suppressing unusable deliver payload (#${emptyDeliverCount})`);
+              return;
+            }
+
+            if (sentReply) {
+              emptyDeliverCount += 1;
+              console.warn(`[crisp] ⚠️ Trace ${traceId} suppressing duplicate deliver after successful reply (#${emptyDeliverCount})`);
               return;
             }
 
             nonEmptyDeliverCount += 1;
-            await sendTextToCrisp({
+            const delivered = await sendTextToCrisp({
               content: text,
               logPrefix: `Trace ${traceId} deliver#${nonEmptyDeliverCount}`,
             });
+            if (!delivered) {
+              emptyDeliverCount += 1;
+              nonEmptyDeliverCount -= 1;
+              console.warn(`[crisp] ⚠️ Trace ${traceId} deliver filtered before send (#${emptyDeliverCount})`);
+              return;
+            }
             sentReply = true;
             console.log(`[crisp] ✅ Sent AI reply to ${sessionId} (nonEmptyDeliverCount=${nonEmptyDeliverCount})`);
             console.log(`[crisp] 🔎 Trace ${traceId} deliver complete`);
@@ -1135,6 +1558,14 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
             console.error(`[crisp] 🔎 Trace ${traceId} onError invoked`);
           },
         },
+        replyOptions: {
+          hasRepliedRef,
+          // Keep the underlying OpenClaw agent attempt just under the Crisp-facing
+          // fallback timeout. 12s was too aggressive in production: valid customer
+          // replies were killed early, then converted into internal failure payloads
+          // and suppressed. Leave a small delivery buffer before the outer timeout.
+          timeoutOverrideSeconds: Math.max(1, Math.ceil(Math.max(1000, config.autoReplyTimeoutMs - 5000) / 1000)),
+        },
       });
 
       let timeoutHandle: NodeJS.Timeout | undefined;
@@ -1149,35 +1580,77 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
       if (timeoutHandle) {
         clearTimeout(timeoutHandle);
       }
-      console.log(`[crisp] 🔎 Trace ${traceId} dispatch complete (sentReply=${sentReply}, nonEmptyDeliverCount=${nonEmptyDeliverCount}, emptyDeliverCount=${emptyDeliverCount}, dispatchErrored=${dispatchErrored}, elapsedMs=${Date.now() - handlerStartedAt})`);
+      console.log(`[crisp] 🔎 Trace ${traceId} dispatch complete (sentReply=${sentReply}, hasRepliedRef=${hasRepliedRef.value}, nonEmptyDeliverCount=${nonEmptyDeliverCount}, emptyDeliverCount=${emptyDeliverCount}, dispatchErrored=${dispatchErrored}, elapsedMs=${Date.now() - handlerStartedAt})`);
+
+      if (!sentReply && hasRepliedRef.value) {
+        sentReply = true;
+        console.log(`[crisp] 🔎 Trace ${traceId} direct channel/tool reply detected; skipping no-valid-deliver fallback`);
+      }
+      if (!sentReply) {
+        const recentOperatorReply = getRecentOperatorReplySince(processingKey, handlerStartedAt - 1000);
+        if (recentOperatorReply) {
+          sentReply = true;
+          console.log(`[crisp] 🔎 Trace ${traceId} observed operator reply webhook during dispatch; skipping no-valid-deliver fallback fingerprint=${recentOperatorReply.fingerprint ?? "-"} ageMs=${Date.now() - recentOperatorReply.at}`);
+        }
+      }
 
       if (!sentReply) {
         const noValidDeliverReason = dispatchErrored ? "dispatch-error-no-valid-deliver" : "dispatch-complete-no-valid-deliver";
         console.warn(`[crisp] ⚠️ Trace ${traceId} dispatch finished without valid deliver (${noValidDeliverReason})`);
 
         const fallbackText = dispatchErrored
-          ? config.autoReplyDispatchErrorMessage.trim()
-          : config.autoReplyNoValidDeliverMessage.trim();
+          ? resolveSafeFallbackMessage(config.autoReplyDispatchErrorMessage)
+          : resolveSafeFallbackMessage(config.autoReplyNoValidDeliverMessage);
         const fallbackLabel = dispatchErrored ? "dispatch-error-fallback" : "no-valid-deliver-fallback";
         const shouldFallback = dispatchErrored || nonEmptyDeliverCount === 0;
         const latestProcessedState = getProcessedMessageState(processingKey, inboundMessageKey);
 
         if (shouldFallback) {
-          if (!fallbackText) {
-            console.warn(`[crisp] ⚠️ Trace ${traceId} ${fallbackLabel} skipped: empty configured message`);
-          } else if (latestProcessedState) {
+          if (latestProcessedState) {
             console.log(`[crisp] 🔎 Trace ${traceId} ${fallbackLabel} skipped: message already marked processed source=${latestProcessedState.source} processedAt=${new Date(latestProcessedState.processedAt).toISOString()} ageMs=${Date.now() - latestProcessedState.processedAt}`);
           } else {
-            try {
-              console.log(`[crisp] 🛟 Trace ${traceId} triggering ${fallbackLabel} reason=${noValidDeliverReason}`);
-              await sendTextToCrisp({
-                content: fallbackText,
-                logPrefix: `Trace ${traceId} ${fallbackLabel}`,
+            if (!fallbackText) {
+              console.log(`[crisp] 🛟 Trace ${traceId} ${fallbackLabel} has no customer-visible fallback configured; notifying human review instead`);
+              await storePendingReplyAndNotify({
+                config,
+                core,
+                route,
+                accountId,
+                sessionId,
+                websiteId: inbound.websiteId,
+                visitorName: inbound.visitorName,
+                messageText: normalizedMessageText,
+                mediaUrl,
               });
-              sentReply = true;
-              console.log(`[crisp] 🛟 Trace ${traceId} ${fallbackLabel} sent successfully`);
-            } catch (fallbackErr) {
-              console.error(`[crisp] ❌ Trace ${traceId} ${fallbackLabel} failed:`, fallbackErr);
+              markCurrentMessageProcessed();
+            } else {
+              try {
+                console.log(`[crisp] 🛟 Trace ${traceId} triggering ${fallbackLabel} reason=${noValidDeliverReason}`);
+                const fallbackSent = await sendTextToCrisp({
+                  content: fallbackText,
+                  logPrefix: `Trace ${traceId} ${fallbackLabel}`,
+                });
+                sentReply = fallbackSent;
+                if (fallbackSent) {
+                  console.log(`[crisp] 🛟 Trace ${traceId} ${fallbackLabel} sent successfully`);
+                } else {
+                  console.log(`[crisp] 🛟 Trace ${traceId} ${fallbackLabel} produced no customer-visible text; notifying human review instead`);
+                  await storePendingReplyAndNotify({
+                    config,
+                    core,
+                    route,
+                    accountId,
+                    sessionId,
+                    websiteId: inbound.websiteId,
+                    visitorName: inbound.visitorName,
+                    messageText: normalizedMessageText,
+                    mediaUrl,
+                  });
+                  markCurrentMessageProcessed();
+                }
+              } catch (fallbackErr) {
+                console.error(`[crisp] ❌ Trace ${traceId} ${fallbackLabel} failed:`, fallbackErr);
+              }
             }
           }
         }
@@ -1185,9 +1658,73 @@ Only output the final customer-facing reply. Do not include reasoning, chain-of-
     } catch (err) {
       console.error(`[crisp] ❌ Failed to handle message:`, err);
       console.error(`[crisp] 🔎 Trace ${traceId} outer catch (${dispatchTimedOut ? "dispatch-timeout" : "error"}) elapsedMs=${Date.now() - handlerStartedAt}`);
+      if (dispatchTimedOut && !sentReply && hasRepliedRef.value) {
+        sentReply = true;
+        console.log(`[crisp] 🔎 Trace ${traceId} direct channel/tool reply detected after timeout; skipping timeout fallback`);
+      }
+      if (dispatchTimedOut && !sentReply) {
+        const recentOperatorReply = getRecentOperatorReplySince(processingKey, handlerStartedAt - 1000);
+        if (recentOperatorReply) {
+          sentReply = true;
+          console.log(`[crisp] 🔎 Trace ${traceId} observed operator reply webhook after timeout; skipping timeout fallback fingerprint=${recentOperatorReply.fingerprint ?? "-"} ageMs=${Date.now() - recentOperatorReply.at}`);
+        }
+      }
+      if (dispatchTimedOut && !sentReply) {
+        const fallbackText = resolveSafeFallbackMessage(config.autoReplyFailureMessage);
+        const latestProcessedState = getProcessedMessageState(processingKey, inboundMessageKey);
+        if (latestProcessedState) {
+          console.log(`[crisp] 🔎 Trace ${traceId} timeout-fallback skipped: message already marked processed source=${latestProcessedState.source} processedAt=${new Date(latestProcessedState.processedAt).toISOString()} ageMs=${Date.now() - latestProcessedState.processedAt}`);
+        } else {
+          if (!fallbackText) {
+            console.log(`[crisp] 🛟 Trace ${traceId} timeout-fallback has no customer-visible fallback configured; notifying human review instead`);
+            await storePendingReplyAndNotify({
+              config,
+              core,
+              route,
+              accountId,
+              sessionId,
+              websiteId: inbound.websiteId,
+              visitorName: inbound.visitorName,
+              messageText: normalizedMessageText,
+              mediaUrl,
+            });
+            markCurrentMessageProcessed();
+          } else {
+            try {
+              console.log(`[crisp] 🛟 Trace ${traceId} triggering timeout-fallback reason=dispatch-timeout`);
+              const fallbackSent = await sendTextToCrisp({
+                content: fallbackText,
+                logPrefix: `Trace ${traceId} timeout-fallback`,
+              });
+              sentReply = fallbackSent;
+              if (fallbackSent) {
+                console.log(`[crisp] 🛟 Trace ${traceId} timeout-fallback sent successfully`);
+              } else {
+                console.log(`[crisp] 🛟 Trace ${traceId} timeout-fallback produced no customer-visible text; notifying human review instead`);
+                await storePendingReplyAndNotify({
+                  config,
+                  core,
+                  route,
+                  accountId,
+                  sessionId,
+                  websiteId: inbound.websiteId,
+                  visitorName: inbound.visitorName,
+                  messageText: normalizedMessageText,
+                  mediaUrl,
+                });
+                markCurrentMessageProcessed();
+              }
+            } catch (fallbackErr) {
+              console.error(`[crisp] ❌ Trace ${traceId} timeout-fallback failed:`, fallbackErr);
+            }
+          }
+        }
+      }
+    } finally {
+      releaseAutoReplySlot?.();
     }
 
-    console.log(`[crisp] 🔎 Trace ${traceId} end inbound handling elapsedMs=${Date.now() - handlerStartedAt} sentReply=${sentReply} nonEmptyDeliverCount=${nonEmptyDeliverCount} emptyDeliverCount=${emptyDeliverCount} dispatchErrored=${dispatchErrored} dispatchTimedOut=${dispatchTimedOut}`);
+    console.log(`[crisp] 🔎 Trace ${traceId} end inbound handling elapsedMs=${Date.now() - handlerStartedAt} sentReply=${sentReply} hasRepliedRef=${hasRepliedRef.value} nonEmptyDeliverCount=${nonEmptyDeliverCount} emptyDeliverCount=${emptyDeliverCount} dispatchErrored=${dispatchErrored} dispatchTimedOut=${dispatchTimedOut}`);
     console.log(`[crisp] 🔓 Session lock release: ${processingKey}`);
   });
 }
@@ -1217,7 +1754,7 @@ async function handleInboundMessage(
     content: extractCrispContentText(data.content),
     origin: data.origin ?? "chat",
     from: "user",
-    timestampMs: data.timestamp ? data.timestamp * 1000 : Date.now(),
+    timestampMs: normalizeCrispTimestampMs(data.timestamp),
     fingerprint: data.fingerprint,
     visitorName: data.user?.nickname || "Visitor",
   };
@@ -1229,6 +1766,103 @@ async function handleInboundMessage(
     trigger: "webhook",
     inbound,
   });
+}
+
+const YINGGE_AGENT_ID = "yingge";
+const YINGGE_SESSIONS_DIR = path.join(
+  process.env.HOME || process.env.USERPROFILE || "/",
+  ".openclaw",
+  "agents",
+  YINGGE_AGENT_ID,
+  "sessions"
+);
+
+function buildBaseCrispSessionKey(websiteId: string, sessionId: string): string {
+  return `agent:${YINGGE_AGENT_ID}:crisp:direct:session_${sessionId}:${websiteId}`;
+}
+
+async function loadYinggeSessionStore(): Promise<Record<string, { sessionId?: string; file?: string }>> {
+  const storePath = path.join(YINGGE_SESSIONS_DIR, "sessions.json");
+  try {
+    const raw = await fs.readFile(storePath, "utf-8");
+    return JSON.parse(raw) as Record<string, { sessionId?: string; file?: string }>;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return {};
+    }
+    throw err;
+  }
+}
+
+async function handleSessionResolvedCleanup(params: {
+  config: CrispConfig;
+  websiteId: string;
+  sessionId: string;
+}): Promise<void> {
+  const { config, websiteId, sessionId } = params;
+
+  if (!config.crispSessionCleanupOnResolved) {
+    console.log(`[crisp] 🧹 cleanup disabled for ${sessionId}; skipping`);
+    return;
+  }
+
+  if (!hasCrispRuntime()) {
+    console.warn(`[crisp] 🧹 no runtime available for cleanup of ${sessionId}`);
+    return;
+  }
+
+  const core = getCrispRuntime();
+  const baseKey = buildBaseCrispSessionKey(websiteId, sessionId);
+
+  // Resolve all possible session keys: base + rolling windows in the store
+  const store = await loadYinggeSessionStore();
+  const keysToDelete: string[] = [];
+  for (const [key, entry] of Object.entries(store)) {
+    if (entry.sessionId === sessionId && (key === baseKey || key.startsWith(`${baseKey}:`))) {
+      keysToDelete.push(key);
+    }
+  }
+  if (keysToDelete.length === 0) {
+    console.log(`[crisp] 🧹 no yingge sessions found for resolved Crisp session ${sessionId}`);
+    return;
+  }
+
+  const archiveDate = new Date().toISOString().slice(0, 10);
+  const archiveDir = path.join(YINGGE_SESSIONS_DIR, "archived-crisp-resolved", archiveDate, sessionId);
+  await fs.mkdir(archiveDir, { recursive: true });
+
+  for (const key of keysToDelete) {
+    const entry = store[key];
+    if (entry?.file) {
+      const filePath = path.join(YINGGE_SESSIONS_DIR, entry.file);
+      try {
+        await fs.copyFile(filePath, path.join(archiveDir, entry.file));
+      } catch (copyErr) {
+        if ((copyErr as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw copyErr;
+        }
+      }
+      const dotParts = entry.file.split(".");
+      for (const ext of ["trajectory-path.json", "codex-app-server.json"]) {
+        const sidecarFile = `${dotParts[0]}.${ext}`;
+        const sidecarPath = path.join(YINGGE_SESSIONS_DIR, sidecarFile);
+        try {
+          await fs.copyFile(sidecarPath, path.join(archiveDir, sidecarFile));
+        } catch (copyErr) {
+          if ((copyErr as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw copyErr;
+          }
+        }
+      }
+    }
+
+    await (core as unknown as { subagent: { deleteSession: (params: { sessionKey: string; deleteTranscript?: boolean }) => Promise<void> } }).subagent.deleteSession({ sessionKey: key, deleteTranscript: true });
+    // Also remove from local store so the session key is released immediately
+    delete store[key];
+    console.log(`[crisp] 🧹 deleted yingge session ${key} for resolved Crisp session ${sessionId}`);
+  }
+
+  console.log(`[crisp] 🧹 archived ${keysToDelete.length} yingge session(s) to ${archiveDir} for resolved Crisp session ${sessionId}`);
 }
 
 function findLatestUserMessage(messages: CrispMessage[]): CrispMessage | null {
@@ -1267,7 +1901,7 @@ export async function runCrispProactiveSweep(params: {
   });
   const now = Date.now();
   const windowStartMs = now - config.proactiveSweepWindowMs;
-  const states: Array<"pending" | "unresolved" | "resolved"> = ["pending", "unresolved", "resolved"];
+  const states = config.proactiveSweepStates;
   const candidates = new Map<string, CrispConversationListItem>();
 
   for (const state of states) {
@@ -1286,7 +1920,7 @@ export async function runCrispProactiveSweep(params: {
   }
 
   const recentCandidates = [...candidates.values()].filter((conversation) => {
-    const updatedAtMs = (conversation.updated_at ?? conversation.created_at ?? 0) * 1000;
+    const updatedAtMs = normalizeCrispTimestampMs(conversation.updated_at ?? conversation.created_at);
     return updatedAtMs >= windowStartMs;
   });
 
@@ -1296,9 +1930,12 @@ export async function runCrispProactiveSweep(params: {
 
   const rescuedSessions: string[] = [];
   const skipReasons = new Map<string, number>();
+  const verboseSkips = process.env.CRISP_SWEEP_VERBOSE === "1";
   const addSkipReason = (reason: string, detail: string): void => {
     skipReasons.set(reason, (skipReasons.get(reason) ?? 0) + 1);
-    console.log(`[crisp] 🧹 Sweep skip ${detail} reason=${reason}`);
+    if (verboseSkips) {
+      console.log(`[crisp] 🧹 Sweep skip ${detail} reason=${reason}`);
+    }
   };
 
   for (const conversation of recentCandidates) {
@@ -1314,7 +1951,7 @@ export async function runCrispProactiveSweep(params: {
         continue;
       }
 
-      const latestMessageTsMs = latestUserMessage.timestamp * 1000;
+      const latestMessageTsMs = normalizeCrispTimestampMs(latestUserMessage.timestamp);
       if (latestMessageTsMs < windowStartMs) {
         addSkipReason("message_outside_window", `session=${conversation.session_id}`);
         continue;
@@ -1364,6 +2001,10 @@ export async function runCrispProactiveSweep(params: {
         },
       });
       rescuedSessions.push(conversation.session_id);
+      if (rescuedSessions.length >= config.proactiveSweepMaxRescuesPerTick) {
+        addSkipReason("max_rescues_reached", `limit=${config.proactiveSweepMaxRescuesPerTick}`);
+        break;
+      }
     } catch (err) {
       addSkipReason("session_error", `session=${conversation.session_id}`);
       console.error(`[crisp] 🧹 Sweep session error session=${conversation.session_id}:`, err);
@@ -1416,9 +2057,18 @@ export function startCrispProactiveSweep(params: {
   }, config.proactiveSweepIntervalMs);
   timer.unref?.();
 
+  // Run one delayed startup tick so missed Crisp webhooks begin draining without
+  // waiting for the first full interval, while still giving Gateway startup time
+  // to finish registering channels and HTTP routes.
+  const startupTimer = setTimeout(() => {
+    void runTick();
+  }, 5000);
+  startupTimer.unref?.();
+
   return () => {
     stopped = true;
     clearInterval(timer);
+    clearTimeout(startupTimer);
     console.log(`[crisp] 🧹 Sweep scheduler stopped account=${accountId}`);
   };
 }
@@ -1474,11 +2124,19 @@ export async function handleCrispWebhookRequest(
     // Route by event type
     switch (body.event) {
       case "message:send":
+        if (body.data?.from === "user" && isIgnoredSession({ accountId, websiteId: body.data.website_id, sessionId: body.data.session_id })) {
+          console.log(`[crisp] 🔄 Reopening ignored session ${body.data.session_id} after user message`);
+          releaseIgnoredSession({ accountId, websiteId: body.data.website_id, sessionId: body.data.session_id });
+        }
         await handleInboundMessage(config, clawdbotConfig, accountId, body);
         break;
 
       case "message:received":
         if (body.data?.from === "user") {
+          if (isIgnoredSession({ accountId, websiteId: body.data.website_id, sessionId: body.data.session_id })) {
+            console.log(`[crisp] 🔄 Reopening ignored session ${body.data.session_id} after user message`);
+            releaseIgnoredSession({ accountId, websiteId: body.data.website_id, sessionId: body.data.session_id });
+          }
           console.log(
             `[crisp] 👤 User received-event treated as inbound: session=${body.data.session_id} website=${body.data.website_id} fingerprint=${body.data.fingerprint ?? "-"} type=${body.data.type ?? "-"} origin=${body.data.origin ?? "-"} content=${JSON.stringify(body.data.content ?? "")}`
           );
@@ -1487,6 +2145,17 @@ export async function handleCrispWebhookRequest(
         }
         if (body.data?.from === "operator") {
           const isHumanOperator = isHumanOperatorWebhook(body.data);
+          const operatorContent = extractCrispContentText(body.data.content);
+          if (body.data.type === "text" && operatorContent.trim()) {
+            recordRecentOperatorReply({
+              accountId,
+              websiteId: body.data.website_id,
+              sessionId: body.data.session_id,
+              content: operatorContent,
+              fingerprint: body.data.fingerprint,
+              timestampMs: normalizeCrispTimestampMs(body.data.timestamp),
+            });
+          }
           console.log(
             `[crisp] 🧾 Operator receipt: session=${body.data.session_id} website=${body.data.website_id} fingerprint=${body.data.fingerprint ?? "-"} type=${body.data.type ?? "-"} origin=${body.data.origin ?? "-"} humanOperator=${isHumanOperator} content=${JSON.stringify(body.data.content ?? "")}`
           );
@@ -1503,10 +2172,21 @@ export async function handleCrispWebhookRequest(
 
       case "session:set_state":
         console.log(`[crisp] Conversation ${body.data.session_id} state: ${body.data.state}`);
+        if (body.data.state === "resolved") {
+          void handleSessionResolvedCleanup({
+            config,
+            websiteId: body.data.website_id,
+            sessionId: body.data.session_id,
+          }).catch((err: unknown) => {
+            console.error(`[crisp] ❌ Cleanup error for session ${body.data.session_id}:`, err);
+          });
+        }
         break;
 
       case "session:set_email":
-        const session = activeSessions.get(body.data.session_id);
+        const session = activeSessions.get(
+          buildTrackedSessionKey(accountId, body.data.website_id, body.data.session_id)
+        );
         if (session && body.data.email) {
           session.visitorEmail = body.data.email;
         }
