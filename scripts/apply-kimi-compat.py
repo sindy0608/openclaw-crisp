@@ -65,18 +65,18 @@ def patch_kimi_catalog():
     if '"id": "kimi-k2.7-code"' not in content:
         print("  ✗ K2.7 model not found in catalog")
         return False
-    if '"reasoning": false' in content:
-        print("  ✓ K2.7 reasoning flag already false")
+    if '"reasoning": true' in content:
+        print("  ✓ K2.7 reasoning flag already true")
         return True
-    if '"reasoning": true' not in content:
-        print("  ✗ K2.7 reasoning flag not boolean true; manual review needed")
+    if '"reasoning": false' not in content:
+        print("  ✗ K2.7 reasoning flag not boolean false; manual review needed")
         return False
     return apply_replace(
         catalog_path,
         content,
-        old='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": true''',
-        new='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": false''',
-        description="Disable K2.7 reasoning flag in catalog",
+        old='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": false''',
+        new='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": true''',
+        description="Keep K2.7 reasoning flag enabled in catalog",
     )
 
 
@@ -194,7 +194,7 @@ def patch_reply_payload():
         content,
         old='''const REASONING_PREFIX_RE = /^(?:reasoning:|thinking\\.{0,3}(?=\\s*(?:>\\s*)?_))/u;''',
         new='''const REASONING_PREFIX_RE = /^(?:reasoning:|thinking\\.{0,3}(?=\\s*(?:>\\s*)?_))/u;
-const KIMI_REASONING_HEURISTIC_RE = /^(?:\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问|根据上下文|但是根据上下文|结合上下文|用户消息是|用户连续发送|用户再次发送|用户发送了|用户说了|用户问的是|用户询问的是|这意味着|这表示客户想要|这种请求意味着|我应该|我已经回复过|让我再次确认|我应该|我需要|我可以|让我看看|让我确认|让我再次|最合理的做法|实际上我应该|实际上我需要|但实际上|考虑到.*通常|回顾对话历史|简洁回复即可|简短回复即可|直接回复即可)[\s\S]{0,500}|\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\s\S]{0,500}|\s*(?:The user said|The user is asking|The user is reporting|The user might be|The customer said|The customer is asking|The customer might be|Looking at the context|Looking at the knowledge base|Looking at the conversation|Actually,|Wait, I should|Wait, I need|I need to check|I should provide guidance|I should just answer|I think the user|In summary|Based on the context|Based on the knowledge base|From the knowledge base|According to the knowledge base|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis|standard|common|typical|user question|customer question|question from the user))[ \t\S]{0,500}|\s*(?:The user's latest message is|The user is saying|There's no new question or issue to address|A brief,? [\w\s]+ response is appropriate|is appropriate here|I (?:should|will|can|need to) (?:respond|reply|answer)|I should keep|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis)))/iu;''',
+const KIMI_REASONING_HEURISTIC_RE = /^(?:\\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问|根据上下文|但是根据上下文|结合上下文|用户消息是|用户连续发送|用户再次发送|用户发送了|用户说了|用户问的是|用户询问的是|这意味着|这表示客户想要|这种请求意味着|我应该|我已经回复过|让我再次确认|我应该|我需要|我可以|让我看看|让我确认|让我再次|让我组织|让我保持|让我梳理|让我列出|最合理的做法|实际上我应该|实际上我需要|但实际上|考虑到.*通常|回顾对话历史|简洁回复即可|简短回复即可|直接回复即可|回复要点|输出要点|不输出任何分析|根据知识库|按照知识库|结合上下文|结合历史对话|根据最新客户消息)[\\s\\S]{0,500}|\\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\\s\\S]{0,500}|\\s*(?:The user said|The user is asking|The user is reporting|The user might be|The customer said|The customer is asking|The customer might be|Looking at the context|Looking at the knowledge base|Looking at the conversation|Actually,|Wait, I should|Wait, I need|I need to check|I should provide guidance|I should just answer|I think the user|In summary|Based on the context|Based on the knowledge base|From the knowledge base|According to the knowledge base|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis|standard|common|typical|user question|customer question|question from the user))[ \\t\\S]{0,500}|\\s*(?:The user's latest message is|The user is saying|There's no new question or issue to address|A brief,? [\\w\\s]+ response is appropriate|is appropriate here|I (?:should|will|can|need to) (?:respond|reply|answer)|I should keep|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis)))/iu;''',
         description="Kimi reasoning heuristic regex (Chinese + English monologue)",
     )
 
