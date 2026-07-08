@@ -54,6 +54,32 @@ def apply_replace(path, content, old, new, description):
     return True
 
 
+def patch_kimi_catalog():
+    catalog_path = "/Users/kusamurajyo/.openclaw/agents/yingge/plugins/kimi/catalog.json"
+    if not os.path.exists(catalog_path):
+        print("kimi-catalog: catalog.json not found")
+        return False
+    print(f"kimi-catalog: {catalog_path}")
+    with open(catalog_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if '"id": "kimi-k2.7-code"' not in content:
+        print("  ✗ K2.7 model not found in catalog")
+        return False
+    if '"reasoning": false' in content:
+        print("  ✓ K2.7 reasoning flag already false")
+        return True
+    if '"reasoning": true' not in content:
+        print("  ✗ K2.7 reasoning flag not boolean true; manual review needed")
+        return False
+    return apply_replace(
+        catalog_path,
+        content,
+        old='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": true''',
+        new='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": false''',
+        description="Disable K2.7 reasoning flag in catalog",
+    )
+
+
 def patch_moonshot_thinking():
     region = "//#region src/llm/providers/stream-wrappers/moonshot-thinking.ts"
     path, content = find_chunk_by_region(region)
@@ -154,23 +180,21 @@ def patch_reply_payload():
     print(f"reply-payload: {path}")
 
     # If already patched (idempotency), just confirm and continue. The full regex
-    # is too long for a literal "new in content" check after minification, so use a
-    # short signature present in the patched version but not the original.
-    if "The user said|Looking at the context|Wait, I should" in content:
+    # is too long for a literal "new in content" check after minification, so check
+    # for the constant declaration directly.
+    if "const KIMI_REASONING_HEURISTIC_RE" in content:
         # Verify the detection wiring is also in place.
         if "if (KIMI_REASONING_HEURISTIC_RE.test(normalized)) return true;" in content:
             print("  ✓ Kimi reasoning heuristic regex (Chinese + English monologue) already applied")
             return True
 
     ok = True
-    # Match Chinese reasoning summaries AND English internal monologues that leak
-    # from K2.7 when it puts chain-of-thought in the regular content field.
     ok &= apply_replace(
         path,
         content,
         old='''const REASONING_PREFIX_RE = /^(?:reasoning:|thinking\\.{0,3}(?=\\s*(?:>\\s*)?_))/u;''',
         new='''const REASONING_PREFIX_RE = /^(?:reasoning:|thinking\\.{0,3}(?=\\s*(?:>\\s*)?_))/u;
-const KIMI_REASONING_HEURISTIC_RE = /^(?:\\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问)[\\s\\S]{0,500}|\\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\\s\\S]{0,500}|\\s*(?:The user said|The user is asking|The user is reporting|The user might be|The customer said|The customer is asking|The customer might be|Looking at the context|Looking at the knowledge base|Looking at the conversation|Actually,|Wait, I should|Wait, I need|I need to check|I should provide guidance|I should just answer|I think the user|In summary|Based on the context|Based on the knowledge base|From the knowledge base|According to the knowledge base|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis|standard|common|typical|user question|customer question|question from the user))[ \\t\\S]{0,500}|\\s*(?:The user's latest message is|The user is saying|There's no new question or issue to address|A brief,? [\\w\\s]+ response is appropriate|is appropriate here|I (?:should|will|can|need to) (?:respond|reply|answer)|I should keep|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis)))/iu;''',
+const KIMI_REASONING_HEURISTIC_RE = /^(?:\\s*(?:用户反馈|客户反馈|用户问[：:]|用户问[：:]"|客户问[：:]|客户问[：:]"|用户询问的是|用户问的是|用户询问|用户问|根据上下文|但是根据上下文|结合上下文|用户消息是|用户连续发送|用户再次发送|用户发送了|用户说了|用户问的是|用户询问的是|这意味着|这表示客户想要|这种请求意味着|我应该|我已经回复过|让我再次确认|我应该|我需要|我可以|让我看看|让我确认|让我再次)[\\s\\S]{0,500}|\\s*(?:这通常是|这显然是|这往往是|一般来说这|一般是|这种情况通常|这属于|这看起来是|该问题通常|该情况通常|此类问题通常)[\\s\\S]{0,500}|\\s*(?:The user said|The user is asking|The user is reporting|The user might be|The customer said|The customer is asking|The customer might be|Looking at the context|Looking at the knowledge base|Looking at the conversation|Actually,|Wait, I should|Wait, I need|I need to check|I should provide guidance|I should just answer|I think the user|In summary|Based on the context|Based on the knowledge base|From the knowledge base|According to the knowledge base|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis|standard|common|typical|user question|customer question|question from the user))[ \\t\\S]{0,500}|\\s*(?:The user's latest message is|The user is saying|There's no new question or issue to address|A brief,? [\\w\\s]+ response is appropriate|is appropriate here|I (?:should|will|can|need to) (?:respond|reply|answer)|I should keep|This is(?: a| just)? (?:brief|acknowledgment|confirmation|reminder|note|explanation|summary|overview|analysis)))/iu;''',
         description="Kimi reasoning heuristic regex (Chinese + English monologue)",
     )
 
@@ -227,6 +251,7 @@ def main():
 
     print("Applying OpenClaw Kimi thinking compatibility patches...\n")
     results = []
+    results.append(("kimi-catalog", patch_kimi_catalog()))
     results.append(("moonshot-thinking", patch_moonshot_thinking()))
     results.append(("openai-transport-stream", patch_openai_transport_stream()))
     results.append(("reply-payload", patch_reply_payload()))
