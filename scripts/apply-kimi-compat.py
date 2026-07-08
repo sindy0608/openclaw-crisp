@@ -65,18 +65,22 @@ def patch_kimi_catalog():
     if '"id": "kimi-k2.7-code"' not in content:
         print("  ✗ K2.7 model not found in catalog")
         return False
-    if '"reasoning": true' in content:
-        print("  ✓ K2.7 reasoning flag already true")
-        return True
-    if '"reasoning": false' not in content:
-        print("  ✗ K2.7 reasoning flag not boolean false; manual review needed")
+
+    # K2.7 is no longer used for yingge; keep it unmarked as a reasoning model so it does not
+    # receive Qwen thinking replay handling if accidentally routed.
+    k27_block = re.search(r'"id": "kimi-k2\.7-code".*?"reasoning": (true|false)', content, re.S)
+    if not k27_block:
+        print("  ✗ K2.7 reasoning flag not found")
         return False
+    if k27_block.group(1) == "false":
+        print("  ✓ K2.7 reasoning flag already false")
+        return True
     return apply_replace(
         catalog_path,
         content,
-        old='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": false''',
-        new='''"id": "kimi-k2.7-code",\n          "name": "K2.7 Code",\n          "reasoning": true''',
-        description="Keep K2.7 reasoning flag enabled in catalog",
+        old='''"id": "kimi-k2.7-code",\\n          "name": "K2.7 Code",\\n          "reasoning": true''',
+        new='''"id": "kimi-k2.7-code",\\n          "name": "K2.7 Code",\\n          "reasoning": false''',
+        description="mark K2.7 reasoning flag false (no longer used by yingge)",
     )
 
 
