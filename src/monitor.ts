@@ -492,12 +492,30 @@ function isInternalDecisionRecord(text: string): boolean {
 }
 
 function isLikelyInternalMonologueParagraph(text: string): boolean {
-  const normalized = text.replace(/\s+/g, "");
-  if (normalized.length < 18) {
+  const trimmed = text.trim();
+  if (trimmed.length < 18) {
     return false;
   }
   if (isVisibleCustomerReplyStart(text) || /[您你](可以|需要|请|好|先|再|提供|确认|查看)|感谢|谢谢|抱歉|不好意思|很高兴|为您|帮您|协助您/.test(text)) {
     return false;
+  }
+
+  // Strong explicit markers that almost always indicate model chain-of-thought.
+  const strongMarkers = [
+    /最合理的做法[是为]/i,
+    /实际上[，,]?我(?:应该|需要|可以|会|想)/i,
+    /但更准确地说[，,]/i,
+    /考虑到[\s\S]{0,30}(?:通常|一般|大多|往往|可能|应该)/i,
+    /(?:简洁|简短|直接)回复(?:即可|就行|就好)/i,
+    /(?:我应该|我需要|我可以|我会|让我先|让我再|让我确认|让我看看|让我判断|让我分析|让我推理|让我思考)[\s\S]{0,30}(?:用户|客户|问题|情况|回复|处理|转人工|知识库)/i,
+    /(?:用户|客户)(?:之前|刚才|上面|刚刚)(?:已经|说过|问|发|提到|问的是|发送的是)/i,
+    /(?:回顾|梳理|总结|整理|罗列|列出)对话历史/i,
+    /^(?:1\.|2\.|3\.|[-*])\s*用户(?:问|发|说|提到|发送)/i,
+  ];
+  for (const marker of strongMarkers) {
+    if (marker.test(trimmed)) {
+      return true;
+    }
   }
 
   const analysisTerms = [
@@ -529,6 +547,7 @@ function isLikelyInternalMonologueParagraph(text: string): boolean {
     "内部",
     "转人工",
   ];
+  const normalized = trimmed.replace(/\s+/g, "");
   const hits = analysisTerms.reduce((count, term) => count + (normalized.includes(term) ? 1 : 0), 0);
   return hits >= 4 && /我|用户|客户/.test(normalized) && /应该|需要|看起来|确认|判断|分析|推理|思考|可能/.test(normalized);
 }
