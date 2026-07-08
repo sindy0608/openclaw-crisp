@@ -153,7 +153,8 @@ def patch_openai_transport_stream():
         return False
     print(f"openai-transport-stream: {path}")
 
-    return apply_replace(
+    ok = True
+    ok &= apply_replace(
         path,
         content,
         old='''\t"kimi-k2.6",
@@ -169,6 +170,31 @@ def patch_openai_transport_stream():
 \t"kimi-k2-thinking",''',
         description="add K2.6/K2.7 variants to replay set",
     )
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    ok &= apply_replace(
+        path,
+        content,
+        old='''function applyQwenOpenAICompletionsThinkingParams(params) {
+\tif (!params.modelReasoning || !isQwenOpenAICompletionsThinkingFormat(params.compatThinkingFormat)) return false;
+\tconst enabled = isOpenAICompletionsThinkingEnabled(params.requestedEffort);
+\tif (params.compatThinkingFormat === "qwen-chat-template") setQwenChatTemplateThinking(params.payload, enabled);
+\telse params.payload.enable_thinking = enabled;
+\treturn true;
+}''',
+        new='''function applyQwenOpenAICompletionsThinkingParams(params) {
+\tif (!params.modelReasoning || !isQwenOpenAICompletionsThinkingFormat(params.compatThinkingFormat)) return false;
+\t// Kimi: force disable enable_thinking to prevent internal reasoning from leaking into plain content.
+\t// See https://platform.kimi.com/docs/guide/use-kimi-k2-thinking-model
+\tconst enabled = false;
+\tif (params.compatThinkingFormat === "qwen-chat-template") setQwenChatTemplateThinking(params.payload, enabled);
+\telse params.payload.enable_thinking = enabled;
+\treturn true;
+}''',
+        description="force disable Kimi enable_thinking to prevent reasoning leakage",
+    )
+    return ok
 
 
 def patch_reply_payload():
