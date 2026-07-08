@@ -596,8 +596,17 @@ function removeInternalReasoningBlocks(text: string, traceId: string): string {
       continue;
     }
 
-    if (isInternalReasoningHeading(trimmedParagraph) || startsWithInternalReasoningHeading(trimmedParagraph) || isInternalDecisionRecord(trimmedParagraph) || isLikelyInternalMonologueParagraph(trimmedParagraph) || isLikelyEnglishInternalMonologue(trimmedParagraph)) {
+    if (isInternalReasoningHeading(trimmedParagraph) || startsWithInternalReasoningHeading(trimmedParagraph) || isInternalDecisionRecord(trimmedParagraph) || isLikelyEnglishInternalMonologue(trimmedParagraph)) {
       dropping = true;
+      droppedCount += 1;
+      continue;
+    }
+
+    if (isLikelyInternalMonologueParagraph(trimmedParagraph)) {
+      // Heuristic-only paragraph: drop just this paragraph, but do not keep
+      // dropping subsequent paragraphs; normal support steps often follow a
+      // model's internal summary. We trust the explicit-heading/line filters
+      // in sanitizeCustomerReply to catch any remaining reasoning.
       droppedCount += 1;
       continue;
     }
@@ -635,6 +644,13 @@ function isUsableCustomerReply(text: string): boolean {
     return false;
   }
   if (/^(您好|你好|亲|亲爱的|尊敬的客户|感谢您的咨询|请稍等|我们会尽快回复|已收到您的消息)[。.!！~～]*$/i.test(normalized)) {
+    return false;
+  }
+  // After filtering reasoning blocks, do not send an incomplete lead-in such as
+  // "请按以下步骤排查：" with no actual steps. This happens when the model prepends
+  // a short customer-facing lead-in and then emits a reasoning block that gets
+  // removed. Fall back to the default message instead.
+  if (/^(?:请按以下步骤排查|请按下面步骤排查|你可以按以下步骤|建议按以下步骤|请按以下步骤|请按以下方式|请按下面方式|请参考以下步骤|请按以下顺序|请按以下指引|建议按以下步骤排查|您可以按以下步骤|您可以参考以下|您可按以下步骤|请按以下步骤操作|请按以下步骤进行|请按以下步骤检查|请按以下步骤处理|请按以下步骤尝试|请按以下步骤设置|请按以下步骤安装|请按以下步骤配置)[：:]?$/i.test(normalized)) {
     return false;
   }
   if (isInternalReasoningHeading(text) || isInternalDecisionRecord(text)) {
